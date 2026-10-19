@@ -266,7 +266,7 @@ export function createVideoCanvasRenderer(video, canvas, {
     stop(); prepare();
     try {
       context = canvas.getContext('2d', { alpha: false });
-      if (!context) throw new Error('Canvas 2D unavailable');
+      if (!context) throw Object.assign(new Error('Canvas 2D unavailable'), { name: 'NotSupportedError' });
       running = true; lastVideoCallbackAt = now();
       const token = generation, current = () => running && token === generation;
       const observe = (_, metadata) => {
@@ -289,6 +289,10 @@ export function createVideoCanvasRenderer(video, canvas, {
     } catch (error) { fail(error); }
   }
   return { prepare, start, stop };
+}
+
+function isRtcErrorRetryable(error) {
+  return !['NotAllowedError', 'NotSupportedError'].includes(error?.name);
 }
 
 // Video WebRTC remains receive-only. Browser audio uses the paired WebSocket.
@@ -320,10 +324,10 @@ export function createRtcReceiver(video, {
     onReset();
     video.srcObject = null; video.hidden = true;
   }
-  function fallback() {
+  function fallback(retryable = true) {
     const current = id;
     close(); onStop();
-    if (current !== null) send({ type: 'rtc-fallback', id: current });
+    if (current !== null) send({ type: 'rtc-fallback', id: current, ...(retryable ? {} : { retryable: false }) });
   }
   async function receive(message) {
     if (message.type === 'rtc-stop') {
@@ -336,7 +340,7 @@ export function createRtcReceiver(video, {
     const token = generation, current = () => generation === token && peer !== null;
     timeout = schedule(() => { if (generation === token) fallback(); }, Math.max(10000, recoveryGraceMs));
     try {
-      if (!supportsCodec(codec)) { fallback(); return; }
+      if (!supportsCodec(codec)) { fallback(false); return; }
       const pc = createPeer(); peer = pc;
       const displayed = () => {
         if (!current() || ready || !video.videoWidth || video.readyState < 2) return;
@@ -424,13 +428,15 @@ export function createRtcReceiver(video, {
         video.srcObject = event.streams[0] || new MediaStream([event.track]);
         onTrack();
         if (!current()) return;
-        video.play().then(displayed).catch(() => { if (current()) fallback(); });
+        video.play().then(displayed).catch(error => {
+          if (current()) fallback(isRtcErrorRetryable(error));
+        });
       };
       await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
       if (!current()) return;
       const answer = await pc.createAnswer();
       if (!current()) return;
-      if (/^m=video 0(?: |\r?$)/m.test(answer.sdp)) { fallback(); return; }
+      if (/^m=video 0(?: |\r?$)/m.test(answer.sdp)) { fallback(false); return; }
       // Use the browser as DTLS server: Mbed TLS 3.6 cannot reassemble a fragmented
       // ClientHello from newer Chrome versions. Passive is a standard answer role.
       await pc.setLocalDescription({ type: answer.type, sdp: answer.sdp.replace(/a=setup:active/g, 'a=setup:passive') });
@@ -442,7 +448,9 @@ export function createRtcReceiver(video, {
       };
       if (pc.iceGatheringState === 'complete') answerReady();
       else pc.onicegatheringstatechange = answerReady;
-    } catch (_) { if (generation === token) fallback(); }
+    } catch (error) {
+      if (generation === token) fallback(isRtcErrorRetryable(error));
+    }
   }
   return { receive, close, fallback, get active() { return ready; }, get codec() { return codec; },
     get recovering() { return ready && (disconnectTimer !== null || stalledSince !== null || statsFailedSince !== null); },
@@ -500,7 +508,7 @@ if (typeof document !== 'undefined') {
       if (!presentation.present(rtcMedia, frameWidth, frameHeight, 'rtc', rtcMedia.revision)) return;
       width = frameWidth; height = frameHeight; jpeg.hide(); clearHeldFrame();
     },
-    onError: () => { if (rtc) rtc.fallback(); },
+    onError: error => { if (rtc) rtc.fallback(isRtcErrorRetryable(error)); },
   });
   const pairApi = async (path, request = null) => {
     const headers = request?.token ? { 'X-Pair-Token': request.token } :
@@ -870,7 +878,7 @@ if (typeof document !== 'undefined') {
           }
           $('stage').textContent = data.stage || t("web_waiting_for_iphone_video");
           rtc.progress(data.rtcFrames || 0);
-          if (data.rtcAvailable && !rtcRequested && typeof RTCPeerConnection !== 'undefined') {
+          if (data.rtcAvailable && !rtcRequested && !rtc.active && typeof RTCPeerConnection !== 'undefined') {
             rtcRequested = true; send({ type: 'rtc-start' });
           }
           // The server resets availability when the iPhone starts a new video configuration.

@@ -399,7 +399,7 @@ internal class LanWebServer(
         private var rtcSource: WebVideoSource? = null
         private var rtcConfig: WebVideoSource.Config? = null
         private var rtc: RtcVideoStream? = null
-        private var rtcAttempted = false
+        private val rtcRetry = RtcRetryPolicy()
         private var rtcId = 0L
         private var rtcAnswered = false
 
@@ -410,14 +410,15 @@ internal class LanWebServer(
                     stopRtc()
                     rtcSource = source
                     rtcConfig = source?.config
-                    rtcAttempted = false
+                    rtcRetry.reset()
                 }
             }
 
-        private fun stopRtc() =
+        private fun stopRtc(retryable: Boolean = true) =
             synchronized(rtcLock) {
                 val old = rtc
                 rtc = null
+                rtcRetry.finish(retryable)
                 if (old != null) {
                     rtcSource?.detach(old)
                     old.close()
@@ -435,11 +436,11 @@ internal class LanWebServer(
             val media = WebSession.mediaSnapshot()
             synchronized(rtcLock) {
                 reconcileVideo()
-                if (rtcAttempted || ended.get() || !WebSession.videoActive) return
+                if (rtc != null || !rtcRetry.available || ended.get() || !WebSession.videoActive) return
                 val source = rtcSource ?: return
                 val config = rtcConfig ?: return
                 if (media.source !== source || media.sourceState == "stopped") return
-                rtcAttempted = true
+                if (!rtcRetry.start()) return
                 rtcAnswered = false
                 val id = ++rtcId
                 val recovery =
@@ -466,7 +467,7 @@ internal class LanWebServer(
                                     )
                             }
                         },
-                        failure = { synchronized(rtcLock) { if (rtcId == id) stopRtc() } },
+                        failure = { retryable -> synchronized(rtcLock) { if (rtcId == id) stopRtc(retryable) } },
                     )
                 rtc = stream
                 if (!source.attach(stream, config)) {
@@ -656,8 +657,10 @@ internal class LanWebServer(
                                     .put(
                                         "rtcAvailable",
                                         rtcSource === media.source && rtcConfig != null &&
-                                            !rtcAttempted && media.sourceState == "ready",
+                                            rtcRetry.available && media.sourceState == "ready",
                                     )
+                                    .put("rtcRetryAfterMs", rtcRetry.retryAfterMs)
+                                    .put("rtcRetryBlocked", rtcRetry.blocked)
                                     .put("rtcFrames", mediaRtc?.sentFrames ?: 0)
                                     .put(
                                         "performance",
@@ -675,7 +678,7 @@ internal class LanWebServer(
                                     .put(
                                         "fallback",
                                         rtcSource?.technology == StreamTechnology.WEBRTC &&
-                                            (rtcAttempted && rtc == null || rtcConfig == null),
+                                            (rtcRetry.attempted && rtc == null || rtcConfig == null),
                                     )
                                     .toString(),
                             )
@@ -717,11 +720,14 @@ internal class LanWebServer(
                         synchronized(rtcLock) {
                             if (data.getLong("id") == rtcId) {
                                 rtc?.displayed()
+                                if (rtc?.holdingFrame == true) rtcRetry.ready()
                                 sender.acknowledge()
                             }
                         }
                     "rtc-fallback" ->
-                        synchronized(rtcLock) { if (data.getLong("id") == rtcId) stopRtc() }
+                        synchronized(rtcLock) {
+                            if (data.getLong("id") == rtcId) stopRtc(data.optBoolean("retryable", true))
+                        }
                     "touch" -> {
                         val contacts = data.getJSONArray("contacts")
                         require(contacts.length() <= 2)
