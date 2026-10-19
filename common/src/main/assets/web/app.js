@@ -17,6 +17,146 @@ export function pairingCodeFromUrl(search) {
   return /^[0-9]{6}$/.test(code) ? code : null;
 }
 
+// Source availability, a committed picture and input readiness are independent.
+// Silence is normal for a static screen; only an explicit gap starts this deadline.
+export function createPresentationController({
+  onChange = () => {}, schedule = setTimeout, cancel = clearTimeout,
+  now = () => performance.now(), holdMs = 2000,
+} = {}) {
+  let connected = false, source = 'waiting', inputReady = true, frame = null;
+  let sessionId = null, videoEpoch = null, revision = 0, invalid = false;
+  let deadline = null, timer = null, timerGeneration = 0;
+  const same = picture => picture && picture.revision === revision && !invalid;
+  function clearDeadline() { cancel(timer); timer = null; deadline = null; timerGeneration++; }
+  function snapshot() {
+    const showing = connected && same(frame) && source === 'ready';
+    const recovering = connected && !!frame && !showing && source !== 'stopped';
+    const held = recovering && deadline !== null && now() < deadline;
+    return { state: !connected ? 'disconnected' : showing ? 'showing' : held ? 'recovering' : 'waiting',
+      visible: showing || held, interactive: showing && inputReady,
+      frame, sessionId, videoEpoch, revision };
+  }
+  function publish() {
+    const value = snapshot();
+    if (value.state === 'showing' || !connected || source === 'stopped' || !frame) clearDeadline();
+    else if (deadline === null) {
+      deadline = now() + holdMs;
+      const token = ++timerGeneration;
+      const expire = () => {
+        if (token !== timerGeneration) return;
+        const remaining = deadline - now();
+        if (remaining > 0) { timer = schedule(expire, remaining); return; }
+        timer = null; onChange(snapshot());
+      };
+      timer = schedule(expire, holdMs);
+    }
+    onChange(snapshot());
+  }
+  function accept(meta = {}) {
+    if (!connected) return false;
+    if (meta.videoEpoch == null) return videoEpoch === null;
+    if (!Number.isSafeInteger(meta.videoEpoch) || !Number.isSafeInteger(meta.sessionId) ||
+        meta.videoEpoch < 0 || meta.sessionId < 0) return false;
+    if (videoEpoch !== null && (meta.videoEpoch < videoEpoch ||
+      meta.videoEpoch === videoEpoch && meta.sessionId !== sessionId)) return false;
+    if (meta.videoEpoch !== videoEpoch || meta.sessionId !== sessionId) {
+      sessionId = meta.sessionId; videoEpoch = meta.videoEpoch; revision++;
+      source = 'waiting'; inputReady = false; invalid = false;
+    }
+    return true;
+  }
+  return {
+    open() { clearDeadline(); connected = true; source = 'waiting'; inputReady = true;
+      frame = null; sessionId = videoEpoch = null; revision++; invalid = false; publish(); },
+    close() { connected = false; frame = null; revision++; publish(); },
+    status(meta) {
+      if (!accept(meta)) return false;
+      // Compatibility with servers predating versioned media packets.
+      if (videoEpoch === null && frame && (meta.width !== frame.width || meta.height !== frame.height)) {
+        revision++; invalid = false;
+      }
+      source = meta.sourceState || (meta.streaming ? 'ready' : 'recovering');
+      inputReady = meta.inputReady ?? source === 'ready';
+      publish(); return true;
+    },
+    present(meta, width, height, transport, expectedRevision = null) {
+      if (!accept(meta) || source === 'stopped' || expectedRevision !== null && expectedRevision !== revision) return false;
+      frame = { width, height, transport, revision }; invalid = false;
+      if (videoEpoch === null) { source = 'ready'; inputReady = true; }
+      publish(); return true;
+    },
+    accepts(meta) {
+      const previous = revision, accepted = accept(meta);
+      if (accepted && previous !== revision) publish();
+      return accepted;
+    },
+    invalidate(transport) { if (frame?.transport === transport) { invalid = true; publish(); } },
+    forget() { frame = null; publish(); },
+    inputUnavailable() { inputReady = false; publish(); },
+    refresh: publish,
+    get current() { return snapshot(); },
+  };
+}
+
+// V2 JPEGs have a 36-byte little-endian header. PCM has a different magic.
+export function decodeVideoPacket(buffer) {
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 4) return null;
+  const view = new DataView(buffer);
+  if (view.getUint32(0, true) !== 0x32565057) return null;
+  if (buffer.byteLength <= 36) throw new Error('Truncated video packet');
+  const packet = { sessionId: view.getFloat64(4, true), videoEpoch: view.getFloat64(12, true),
+    sequence: view.getFloat64(20, true), width: view.getUint32(28, true), height: view.getUint32(32, true) };
+  if (![packet.sessionId, packet.videoEpoch, packet.sequence].every(value => Number.isSafeInteger(value) && value >= 0) ||
+      packet.width < 1 || packet.height < 1) throw new Error('Invalid video packet');
+  return { ...packet, jpeg: buffer.slice(36) };
+}
+
+// Decode into the hidden image and commit the image and geometry together.
+export function createJpegPresenter(images, { onFrame, onError = () => {},
+  createUrl = data => URL.createObjectURL(data), revokeUrl = url => URL.revokeObjectURL(url),
+} = {}) {
+  let front = null, pending = null, pendingDone = null, generation = 0;
+  const urls = new Map();
+  function discard(image) {
+    image.onload = image.onerror = null; image.removeAttribute('src'); image.hidden = true;
+    if (urls.has(image)) revokeUrl(urls.get(image)); urls.delete(image);
+  }
+  function cancelPending() {
+    generation++; if (pending) discard(pending); pending = null;
+    const done = pendingDone; pendingDone = null; if (done) done();
+  }
+  return {
+    load(data, meta, valid, done) {
+      cancelPending();
+      const image = images.find(item => item !== front), token = generation;
+      pending = image; pendingDone = done; image.hidden = true;
+      const url = createUrl(data); urls.set(image, url);
+      image.onload = () => {
+        if (token !== generation || pending !== image) return;
+        pending = null; pendingDone = null; image.onload = image.onerror = null;
+        if (!valid() || !image.naturalWidth || !image.naturalHeight) { discard(image); done(); return; }
+        const previous = front;
+        const accepted = onFrame(meta, image.naturalWidth, image.naturalHeight);
+        if (token !== generation) { done(); return; }
+        if (accepted === false) { discard(image); done(); return; }
+        front = image; image.hidden = false;
+        if (previous) discard(previous);
+        done();
+      };
+      image.onerror = () => {
+        if (token !== generation) return;
+        pending = null; pendingDone = null; discard(image); done(); onError();
+      };
+      image.src = url;
+    },
+    cancelPending,
+    hide() { if (front) front.hidden = true; },
+    show() { if (front) front.hidden = false; },
+    clear() { cancelPending(); images.forEach(discard); front = null; },
+    get current() { return front; },
+  };
+}
+
 // Keep essential controls until WebSocket accepts them. A successful send is never retried.
 export function createControlOutbox(socket, {
   schedule = setTimeout, cancel = clearTimeout, now = () => Date.now(), onFailure = () => socket.close(),
@@ -177,8 +317,8 @@ export function createRtcReceiver(video, {
     frameCallback = null; presented = 0; previousStats = null;
     video.onloadeddata = null; video.onerror = null;
     if (old) { old.ontrack = null; old.onconnectionstatechange = null; old.close(); }
-    video.srcObject = null; video.hidden = true;
     onReset();
+    video.srcObject = null; video.hidden = true;
   }
   function fallback() {
     const current = id;
@@ -321,6 +461,8 @@ import { createBrowserAudio } from './browser-audio.js';
 if (typeof document !== 'undefined') {
   const $ = id => document.getElementById(id);
   const screen = $('screen');
+  const screens = [screen, $('screen-next')];
+  const heldFrame = $('held-frame');
   const video = $('video');
   const canvas = $('video-canvas');
   const display = $('display');
@@ -330,13 +472,23 @@ if (typeof document !== 'undefined') {
   Object.defineProperty(window, 'wheelplayStats', { configurable: true, get: () => JSON.parse(JSON.stringify(performanceStats)) });
   let rtc = null, rtcRequested = false, rtcFps = null;
   let socket = null, stopped = true, paired = false, retry = null, attempts = 0;
-  let width = 1280, height = 720, live = false, objectUrl = null, lastFrame = 0, lastStatus = 0;
+  let width = 1280, height = 720, live = false, lastStatus = 0, rtcMedia = {};
   let heartbeat = null, movePending = false, moveGeneration = 0, outbox = null;
   let authGeneration = 0, deviceCredential = null, storageAvailable = false;
   let launchPresentation = null;
   const devicePreference = 'wheelplay.browserDevice';
   let pairingToken = null, qrGeneration = 0, qrTimer = null, qrRequest = null;
   let viewportReportTimer = null, lastViewportSignature = '';
+  const presentation = createPresentationController({ onChange: renderPresentation });
+  const jpeg = createJpegPresenter(screens, {
+    onFrame: (meta, frameWidth, frameHeight) => {
+      if (meta.width && (meta.width !== frameWidth || meta.height !== frameHeight)) return false;
+      if (!presentation.present(meta, frameWidth, frameHeight, 'jpeg', meta.revision)) return false;
+      width = frameWidth; height = frameHeight;
+      clearHeldFrame(); return true;
+    },
+    onError: () => presentation.invalidate('jpeg'),
+  });
   const canvasOption = $('canvas-video');
   const canvasPreference = 'wheelplay.canvasVideo';
   try { canvasOption.checked = window.localStorage.getItem(canvasPreference) === 'true'; } catch (_) {}
@@ -345,7 +497,8 @@ if (typeof document !== 'undefined') {
   });
   const canvasRenderer = createVideoCanvasRenderer(video, canvas, {
     onFrame: (frameWidth, frameHeight) => {
-      width = frameWidth; height = frameHeight; screen.hidden = true; setLive(true);
+      if (!presentation.present(rtcMedia, frameWidth, frameHeight, 'rtc', rtcMedia.revision)) return;
+      width = frameWidth; height = frameHeight; jpeg.hide(); clearHeldFrame();
     },
     onError: () => { if (rtc) rtc.fallback(); },
   });
@@ -501,7 +654,13 @@ if (typeof document !== 'undefined') {
   }
   $('refresh-qr').addEventListener('click', startQr);
   const pointers = new Map();
-  const send = (data, kind) => outbox ? outbox.send(data, kind) : false;
+  const send = (data, kind) => {
+    if (data.type === 'touch' && presentation.current.videoEpoch !== null) {
+      const { sessionId, videoEpoch } = presentation.current;
+      data = { ...data, sessionId, videoEpoch };
+    }
+    return outbox ? outbox.send(data, kind) : false;
+  };
   const browserAudio = createBrowserAudio({
     send,
     sendBinary: packet => {
@@ -550,26 +709,40 @@ if (typeof document !== 'undefined') {
   function cancelMove() { moveGeneration++; movePending = false; }
   function contacts() { return [...pointers.values()].map(p => ({ id: p.id, x: p.x, y: p.y, down: true })); }
   function release() { cancelMove(); pointers.clear(); send({ type: 'touch', contacts: [] }); }
-  function setLive(value) {
-    live = value;
-    screen.classList.toggle('stale', !value);
-    video.classList.toggle('stale', !value);
-    canvas.classList.toggle('stale', !value);
-    touchSurface.classList.toggle('stale', !value);
-    $('waiting').hidden = value;
-    if (!value && pointers.size) release();
+  function renderPresentation(value) {
+    live = value.interactive;
+    for (const surface of [...screens, video, canvas, heldFrame]) surface.classList.toggle('stale', !value.visible);
+    touchSurface.classList.toggle('stale', !live);
+    $('waiting').hidden = value.visible;
+    if (!live && pointers.size) release();
+    const transport = rtc && (rtc.active || value.frame?.transport === 'rtc') ? `${rtc.codec === 'H265' ? 'HEVC' : 'H.264'} / WebRTC${canvasOption.checked ? ' / Canvas' : ''}${rtcFps === null ? '' : ` · ${rtcFps} fps`}` : 'JPEG';
+    $('status').textContent = value.state === 'recovering' ? t('web_video_recovering', transport) :
+      value.visible ? value.interactive ? t('web_transport_touch_connected', transport, rtc?.recovering ? t('web_waiting_for_recovery') : '') :
+        t('web_video_input_unavailable', transport) : t('web_connected_waiting_for_iphone_video');
+    $('media-message').hidden = !value.visible || value.interactive;
+    $('media-message').textContent = value.visible && !value.interactive ? $('status').textContent : '';
+  }
+  function clearHeldFrame() {
+    heldFrame.hidden = true; heldFrame.width = heldFrame.height = 0;
+  }
+  function holdRtcFrame() {
+    if (presentation.current.frame?.transport !== 'rtc' || !heldFrame.hidden) return;
+    try {
+      const source = canvas.hidden ? video : canvas;
+      const frame = presentation.current.frame;
+      heldFrame.width = frame.width; heldFrame.height = frame.height;
+      heldFrame.getContext('2d', { alpha: false }).drawImage(source, 0, 0, frame.width, frame.height);
+      heldFrame.hidden = false;
+    } catch (_) { clearHeldFrame(); presentation.forget(); }
   }
   function cleanupImage() {
-    screen.onload = null; screen.onerror = null; screen.removeAttribute('src');
-    screen.hidden = true;
-    if (objectUrl) URL.revokeObjectURL(objectUrl);
-    objectUrl = null;
+    jpeg.clear(); clearHeldFrame();
   }
   function cleanupRtc() {
     if (rtc) rtc.close(); rtc = null; rtcRequested = false; rtcFps = null;
     canvasRenderer.stop();
     performanceStats.source = performanceStats.transport = performanceStats.receiver = null;
-    screen.hidden = !(screen.complete && screen.naturalWidth > 0); video.hidden = true;
+    video.hidden = true;
   }
   function exitLaunchFullscreen() {
     try { Promise.resolve(document.exitFullscreen()).catch(() => {}); } catch (_) {}
@@ -600,7 +773,7 @@ if (typeof document !== 'undefined') {
     if (outbox) { outbox.close(); outbox = null; }
     clearTimeout(retry); clearInterval(heartbeat);
     if (socket) { const old = socket; socket = null; old.close(); }
-    cleanupRtc(); cleanupImage(); setLive(false);
+    presentation.close(); cleanupRtc(); cleanupImage();
     browserAudio.close(); $('audio-message').hidden = true;
     $('topbar').hidden = false; $('pairing').hidden = false; $('display').hidden = true;
     $('disconnect').hidden = true; $('connect').disabled = false;
@@ -612,7 +785,7 @@ if (typeof document !== 'undefined') {
     $('connect').disabled = true;
     $('status').textContent = paired ? t("web_reconnecting") : t("web_connecting");
     const auth = pairingToken ? `token=${encodeURIComponent(pairingToken)}` : `code=${encodeURIComponent($('code').value)}`;
-    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream?${auth}`);
+    const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream?${auth}&media=2`);
     ws.binaryType = 'arraybuffer';
     const useCanvas = canvasOption.checked;
     socket = ws;
@@ -623,24 +796,25 @@ if (typeof document !== 'undefined') {
       if (outbox) outbox.close();
       outbox = createControlOutbox(ws, { onFailure: () => {
         if (socket !== ws) return;
-        cancelMove(); pointers.clear(); setLive(false); ws.close();
+        cancelMove(); pointers.clear(); presentation.close(); ws.close();
       } });
       paired = true; attempts = 0; lastStatus = Date.now();
       browserAudio.attach();
       cleanupRtc();
+      presentation.open();
       rtc = createRtcReceiver(video, { send,
         onTrack: () => { if (useCanvas) canvasRenderer.prepare(); },
-        onReset: () => canvasRenderer.stop(),
+        onReset: () => { holdRtcFrame(); canvasRenderer.stop(); presentation.invalidate('rtc'); },
         onReady: () => {
           if (socket !== ws) return;
           if (useCanvas) { canvasRenderer.start(); return; }
-          screen.hidden = true; video.hidden = false;
-          width = video.videoWidth; height = video.videoHeight; setLive(true);
+          if (!presentation.present(rtcMedia, video.videoWidth, video.videoHeight, 'rtc', rtcMedia.revision)) return;
+          jpeg.hide(); clearHeldFrame(); video.hidden = false;
+          width = video.videoWidth; height = video.videoHeight;
         },
         onStop: () => {
           if (socket !== ws) return;
-          screen.hidden = !(screen.complete && screen.naturalWidth > 0); video.hidden = true; rtcFps = null;
-          setLive(Boolean(lastFrame && screen.naturalWidth));
+          video.hidden = true; rtcFps = null; presentation.invalidate('rtc');
         },
         onStats: (fps, metrics) => { rtcFps = fps === null ? null : Math.round(fps); performanceStats.receiver = metrics; },
       });
@@ -655,6 +829,7 @@ if (typeof document !== 'undefined') {
       send({ type: 'ping' });
       clearInterval(heartbeat);
       heartbeat = setInterval(() => {
+        presentation.refresh();
         if (Date.now() - lastStatus > 6000) { ws.close(); return; }
         send({ type: 'ping' });
         if (pointers.size) send({ type: 'touch', contacts: contacts() }, 'move');
@@ -667,6 +842,12 @@ if (typeof document !== 'undefined') {
         if (browserAudio.control(data)) return;
         if (data.type === 'rtc-offer' || data.type === 'rtc-stop') {
           if (data.type === 'rtc-stop') rtcRequested = false;
+          else {
+            const previousRevision = presentation.current.revision;
+            if (!presentation.accepts(data)) return;
+            if (previousRevision !== presentation.current.revision) jpeg.cancelPending();
+            rtcMedia = { ...data, revision: presentation.current.revision };
+          }
           rtc.receive(data); return;
         }
         if (data.type === 'phone-connect-result') {
@@ -680,7 +861,13 @@ if (typeof document !== 'undefined') {
         if (data.type === 'status') {
           performanceStats.source = data.performance?.source ?? null;
           performanceStats.transport = data.performance?.transport ?? null;
-          lastStatus = Date.now(); width = data.width; height = data.height;
+          lastStatus = Date.now();
+          const previousRevision = presentation.current.revision;
+          if (!presentation.status(data)) return;
+          if (previousRevision !== presentation.current.revision) {
+            jpeg.cancelPending();
+            if (rtcMedia.revision !== presentation.current.revision) { rtc.close(); rtcRequested = false; }
+          }
           $('stage').textContent = data.stage || t("web_waiting_for_iphone_video");
           rtc.progress(data.rtcFrames || 0);
           if (data.rtcAvailable && !rtcRequested && typeof RTCPeerConnection !== 'undefined') {
@@ -688,34 +875,31 @@ if (typeof document !== 'undefined') {
           }
           // The server resets availability when the iPhone starts a new video configuration.
           if (!data.rtcAvailable) rtcRequested = false;
-          setLive(Boolean(data.streaming && (rtc.active || lastFrame && screen.naturalWidth)));
-          const transport = rtc.active ? `${rtc.codec === 'H265' ? 'HEVC' : 'H.264'} / WebRTC${useCanvas ? ' / Canvas' : ''}${rtcFps === null ? '' : ` · ${rtcFps} fps`}` : `JPEG${data.fallback ? t("web_fallback") : ''}`;
-          $('status').textContent = live ? t("web_transport_touch_connected", transport, rtc.recovering ? t("web_waiting_for_recovery") : '') : t("web_connected_waiting_for_iphone_video");
+          presentation.refresh();
         }
-        if (data.type === 'input-unavailable') $('status').textContent = t("web_waiting_for_iphone_touch_input");
+        if (data.type === 'input-unavailable') presentation.inputUnavailable();
         return;
       }
       if (browserAudio.receive(event.data)) return;
-      if (rtc && rtc.active) { send({ type: 'ack' }); return; }
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-      objectUrl = URL.createObjectURL(event.data instanceof ArrayBuffer ? new Blob([event.data], { type: 'image/jpeg' }) : event.data);
-      screen.onload = () => {
-        if (socket !== ws || ws.readyState !== WebSocket.OPEN) return;
-        if (rtc && rtc.active) { send({ type: 'ack' }); return; }
-        screen.hidden = false;
-        lastFrame = Date.now(); width = screen.naturalWidth; height = screen.naturalHeight;
-        if (!rtc || !rtc.active) { setLive(true); $('status').textContent = t("web_jpeg_touch_connected"); }
-        send({ type: 'ack' });
-      };
-      screen.onerror = () => { screen.hidden = true; ws.close(); };
-      screen.src = objectUrl;
+      let packet;
+      try { packet = decodeVideoPacket(event.data); } catch (_) { ws.close(); return; }
+      const meta = packet || {};
+      const previousRevision = presentation.current.revision;
+      if (!presentation.accepts(meta)) { send({ type: 'ack' }); return; }
+      if (previousRevision !== presentation.current.revision) { rtc.close(); rtcRequested = false; }
+      if (rtc?.active) { send({ type: 'ack' }); return; }
+      meta.revision = presentation.current.revision;
+      const payload = packet ? packet.jpeg : event.data;
+      jpeg.load(payload instanceof ArrayBuffer ? new Blob([payload], { type: 'image/jpeg' }) : payload, meta,
+        () => socket === ws && ws.readyState === WebSocket.OPEN && !rtc?.active && presentation.current.revision === meta.revision,
+        () => { if (socket === ws && ws.readyState === WebSocket.OPEN) send({ type: 'ack' }); });
     };
     ws.onclose = () => {
       clearTimeout(connectTimer);
       if (socket !== ws) return;
       if (outbox) { outbox.close(); outbox = null; }
       cancelMove();
-      socket = null; pointers.clear(); clearInterval(heartbeat); cleanupRtc(); cleanupImage(); setLive(false);
+      socket = null; pointers.clear(); clearInterval(heartbeat); presentation.close(); cleanupRtc(); cleanupImage();
       browserAudio.close(); $('audio-message').hidden = true;
       if (stopped) return;
       if (!paired || ++attempts > 8) {
@@ -801,7 +985,7 @@ if (typeof document !== 'undefined') {
     scheduleViewportReport();
   });
   // A separate layer prevents Android Chrome's native video gestures cancelling drags.
-  for (const surface of [screen, video, canvas, touchSurface]) {
+  for (const surface of [...screens, video, canvas, touchSurface]) {
   surface.addEventListener('contextmenu', event => event.preventDefault());
   surface.addEventListener('pointerdown', event => {
     if (!live || pointers.size >= 2 || (event.pointerType === 'mouse' && event.button !== 0)) return;
@@ -840,7 +1024,7 @@ if (typeof document !== 'undefined') {
   surface.addEventListener('lostpointercapture', up);
   }
   window.addEventListener('blur', release);
-  document.addEventListener('visibilitychange', () => { if (document.hidden) release(); });
+  document.addEventListener('visibilitychange', () => { if (document.hidden) release(); presentation.refresh(); });
   window.addEventListener('pagehide', () => disconnect(false));
   window.addEventListener('pageshow', event => { if (event.persisted) initializePairing(); });
   const linkedCode = pairingCodeFromUrl(window.location?.search || '');
