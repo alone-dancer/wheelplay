@@ -1,4 +1,28 @@
 import { t } from './text.js';
+// A surface inversely scaled inside the visual viewport cancels browser zoom.
+// Its bounding rectangle remains in the same CSS coordinates as pointer events.
+export function unzoomedDisplayRect(rect, visual) {
+  if (!visual || !Number.isFinite(visual.scale) || visual.scale <= 0 || visual.width <= 0 || visual.height <= 0) return null;
+  const left = visual.offsetLeft || 0, offsetTop = visual.offsetTop || 0;
+  const top = Math.max(offsetTop, rect.top || 0);
+  return { left, top, width: visual.width, height: Math.max(0, offsetTop + visual.height - top), scale: visual.scale };
+}
+
+// Match WebSession's viewport bounds. A small visible area can still display a
+// larger negotiated canvas; scale both axes together instead of stretching it.
+export function browserViewportSize(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  const ratio = width / height;
+  if (ratio < 0.5 || ratio > 4) return null;
+  const scale = Math.min(8192 / Math.max(width, height), Math.max(1, 320 / Math.min(width, height)));
+  const even = value => Math.round(value / 2) * 2;
+  const h = even(height * scale);
+  // Even-pixel rounding must not push an otherwise valid ratio outside bounds.
+  const w = Math.max(Math.ceil(h / 4) * 2, Math.min(h * 4, even(width * scale)));
+  if (!Number.isFinite(w) || !Number.isFinite(h) || w < 320 || h < 320 || w > 8192 || h > 8192) return null;
+  return { width: w, height: h };
+}
+
 // Coordinates are normalized in the visible video rectangle, excluding letterboxing.
 export function mapPoint(clientX, clientY, rect, width, height, clamp = false) {
   if (width <= 0 || height <= 0 || rect.width <= 0 || rect.height <= 0) return null;
@@ -337,6 +361,28 @@ if (typeof document !== 'undefined') {
   const devicePreference = 'wheelplay.browserDevice';
   let pairingToken = null, qrGeneration = 0, qrTimer = null, qrRequest = null;
   let viewportReportTimer = null, lastViewportSignature = '';
+  const ignoreZoomOption = $('ignore-browser-zoom');
+  const ignoreZoomPreference = 'wheelplay.ignoreBrowserZoom';
+  try { ignoreZoomOption.checked = window.localStorage.getItem(ignoreZoomPreference) === 'true'; } catch (_) {}
+  function syncDisplayZoom() {
+    if (!display.style) return;
+    const area = ignoreZoomOption.checked && !display.hidden
+      ? unzoomedDisplayRect(display.parentElement.getBoundingClientRect(), window.visualViewport) : null;
+    display.classList.toggle('ignore-browser-zoom', Boolean(area));
+    if (area) {
+      Object.assign(display.style, {
+        left: `${area.left}px`, top: `${area.top}px`,
+        width: `${area.width * area.scale}px`, height: `${area.height * area.scale}px`,
+        transform: `scale(${1 / area.scale})`,
+      });
+    } else {
+      for (const name of ['left', 'top', 'width', 'height', 'transform']) display.style.removeProperty(name);
+    }
+  }
+  ignoreZoomOption.addEventListener('change', () => {
+    try { window.localStorage.setItem(ignoreZoomPreference, String(ignoreZoomOption.checked)); } catch (_) {}
+    release(); syncDisplayZoom(); scheduleViewportReport();
+  });
   const canvasOption = $('canvas-video');
   const canvasPreference = 'wheelplay.canvasVideo';
   try { canvasOption.checked = window.localStorage.getItem(canvasPreference) === 'true'; } catch (_) {}
@@ -534,11 +580,14 @@ if (typeof document !== 'undefined') {
   function scheduleViewportReport() {
     clearTimeout(viewportReportTimer);
     viewportReportTimer = setTimeout(() => {
+      syncDisplayZoom();
       if (!socket || socket.readyState !== WebSocket.OPEN || display.hidden) return;
-      const rect = display.getBoundingClientRect(), scale = window.devicePixelRatio || 1;
-      const width = Math.round(rect.width * scale / 2) * 2;
-      const height = Math.round(rect.height * scale / 2) * 2;
-      if (width < 320 || height < 240) return;
+      const rect = display.getBoundingClientRect();
+      const zoom = ignoreZoomOption.checked ? window.visualViewport?.scale || 1 : 1;
+      const scale = (window.devicePixelRatio || 1) * zoom;
+      const size = browserViewportSize(rect.width * scale, rect.height * scale);
+      if (!size) return;
+      const { width, height } = size;
       const signature = `${width}x${height}`;
       if (signature === lastViewportSignature) return;
       lastViewportSignature = signature;
@@ -547,6 +596,10 @@ if (typeof document !== 'undefined') {
   }
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(scheduleViewportReport).observe(display);
   window.addEventListener('resize', scheduleViewportReport);
+  for (const event of ['resize', 'scroll']) window.visualViewport?.addEventListener(event, () => {
+    if (!ignoreZoomOption.checked) return;
+    syncDisplayZoom(); scheduleViewportReport();
+  });
   function cancelMove() { moveGeneration++; movePending = false; }
   function contacts() { return [...pointers.values()].map(p => ({ id: p.id, x: p.x, y: p.y, down: true })); }
   function release() { cancelMove(); pointers.clear(); send({ type: 'touch', contacts: [] }); }
@@ -603,6 +656,7 @@ if (typeof document !== 'undefined') {
     cleanupRtc(); cleanupImage(); setLive(false);
     browserAudio.close(); $('audio-message').hidden = true;
     $('topbar').hidden = false; $('pairing').hidden = false; $('display').hidden = true;
+    syncDisplayZoom();
     $('disconnect').hidden = true; $('connect').disabled = false;
     $('status').textContent = t("web_disconnected");
     if (refreshQr) initializePairing();

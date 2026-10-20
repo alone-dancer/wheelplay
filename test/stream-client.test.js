@@ -9,24 +9,37 @@ const source = readFileSync(new URL('../common/src/main/assets/web/text.js', imp
   .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
   readFileSync(new URL('../common/src/main/assets/web/app.js', import.meta.url), 'utf8')
     .replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
-function fixture({ storedCanvas = null, storageDisabled = false, canvasAvailable = true,
+function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled = false, canvasAvailable = true,
+  geometry = null, visual = null,
   fullscreen = 'supported', codeDenied = false, resume = () => ({ token: 'session-token', name: 'Chrome' }) } = {}) {
   const elements = new Map(), timers = new Map(), raf = new Map(), sockets = [], peers = [], draws = [];
   const preferences = new Map(storedCanvas === null ? [] : [['wheelplay.canvasVideo', storedCanvas]]);
+  if (storedIgnoreZoom !== null) preferences.set('wheelplay.ignoreBrowserZoom', storedIgnoreZoom);
   const videoCallbacks = new Map();
   const documentEvents = {}, fullscreenCalls = [];
+  const visualEvents = {};
+  const visualViewport = visual ? { ...visual, addEventListener(type, fn) { visualEvents[type] = fn; } } : undefined;
+  const mainRect = geometry ? { left: 0, top: geometry.top, width: geometry.width, height: geometry.height - geometry.top }
+    : { left: 0, top: 0, width: 1280, height: 720 };
   let nextTimer = 0, nextFrame = 0;
   const element = id => {
     const classes = new Set();
     if (!elements.has(id)) elements.set(id, { hidden: false, value: '123456', handlers: {}, naturalWidth: 1280, naturalHeight: 720,
       checked: false, videoWidth: 1280, videoHeight: 720, readyState: 2, currentTime: 0,
+      style: { removeProperty(name) { delete this[name]; } },
+      parentElement: { getBoundingClientRect: () => mainRect },
       getContext: () => canvasAvailable ? { drawImage: (...args) => draws.push(args) } : null,
       play: async () => {},
       requestVideoFrameCallback(fn) { const frame = ++nextFrame; videoCallbacks.set(frame, fn); return frame; },
       cancelVideoFrameCallback(frame) { videoCallbacks.delete(frame); },
       classList: { toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); }, contains: name => classes.has(name) },
       removeAttribute() {}, setAttribute() {}, setPointerCapture() {},
-      getBoundingClientRect: () => ({ left: 0, top: 0, width: 1280, height: 720 }),
+      getBoundingClientRect() {
+        if (id !== 'display' || !classes.has('ignore-browser-zoom')) return mainRect;
+        const scale = Number(this.style.transform.match(/scale\((.*)\)/)[1]);
+        return { left: parseFloat(this.style.left), top: parseFloat(this.style.top),
+          width: parseFloat(this.style.width) * scale, height: parseFloat(this.style.height) * scale };
+      },
       addEventListener(name, fn) { this.handlers[name] = fn; } });
     return elements.get(id);
   };
@@ -57,7 +70,7 @@ function fixture({ storedCanvas = null, storageDisabled = false, canvasAvailable
     if (fullscreen === 'denied') return Promise.reject(new Error('fullscreen denied'));
     enterFullscreen(); return Promise.resolve();
   };
-  const context = { document, window: { addEventListener() {},
+  const context = { document, window: { addEventListener() {}, visualViewport,
     localStorage: {
       getItem(key) { if (storageDisabled) throw new Error('denied'); return preferences.get(key) ?? null; },
       setItem(key, value) { if (storageDisabled) throw new Error('denied'); preferences.set(key, value); },
@@ -79,7 +92,11 @@ function fixture({ storedCanvas = null, storageDisabled = false, canvasAvailable
   };
   context.wheelplayMessages = messages;
   vm.runInNewContext(source, context);
-  return { element, sockets, timers, peers, draws, preferences, raf, videoCallbacks, document, fullscreenCalls,
+  return { element, sockets, timers, peers, draws, preferences, raf, videoCallbacks, document, fullscreenCalls, visualViewport, visualEvents,
+    reportViewport() {
+      const [id, timer] = [...timers].find(([, t]) => t.delay === 180);
+      timers.delete(id); timer.fn();
+    },
     async connect() {
       element('connect-form').handlers.submit({ preventDefault() {} });
       await new Promise(resolve => setImmediate(resolve));
@@ -337,4 +354,55 @@ test('revocation during an active display stops retries and requires fresh pairi
   assert.equal(f.sockets.length, 1);
   assert.equal(f.element('code-entry').hidden, false);
   assert.equal(f.preferences.has('wheelplay.browserDevice'), false);
+});
+
+test('ignore browser zoom defaults off and restores the saved choice', () => {
+  const f = fixture();
+  assert.equal(f.element('ignore-browser-zoom').checked, false);
+  const option = f.element('ignore-browser-zoom');
+  option.checked = true;
+  option.handlers.change({ target: option });
+  assert.equal(f.element('ignore-browser-zoom').checked, true);
+  assert.equal(f.preferences.get('wheelplay.ignoreBrowserZoom'), 'true');
+  const restored = fixture({ storedIgnoreZoom: 'true' });
+  assert.equal(restored.element('ignore-browser-zoom').checked, true);
+  const denied = fixture({ storageDisabled: true });
+  const primary = denied.element('ignore-browser-zoom');
+  primary.checked = true;
+  assert.doesNotThrow(() => primary.handlers.change({ target: primary }));
+});
+
+test('a short split-screen viewport sends a valid canvas through the real zoom/style/report path', async () => {
+  const f = fixture({ storedIgnoreZoom: 'true', geometry: { width: 960, height: 400, top: 64 },
+    visual: { width: 960, height: 400, scale: 1, offsetLeft: 0, offsetTop: 0 } });
+  const ws = await f.connect();
+  f.reportViewport();
+  assert.deepEqual(ws.sent.find(m => m.type === 'viewport'), { type: 'viewport', width: 960, height: 336 });
+  Object.assign(f.visualViewport, { width: 640, height: 400 / 1.5, scale: 1.5 });
+  f.visualEvents.resize(); f.reportViewport();
+  const surface = f.element('display');
+  assert.equal(surface.classList.contains('ignore-browser-zoom'), true);
+  assert.equal(surface.style.transform, `scale(${1 / 1.5})`);
+  const report = ws.sent.filter(m => m.type === 'viewport').at(-1);
+  assert.deepEqual(report, { type: 'viewport', width: 1010, height: 320 });
+  assert.ok(Math.abs(report.width / report.height - 960 / 304) < 0.01);
+  const count = ws.sent.length;
+  f.visualEvents.resize(); f.reportViewport();
+  assert.equal(ws.sent.length, count, 'unchanged geometry must not renegotiate');
+  const option = f.element('ignore-browser-zoom'); option.checked = false; option.handlers.change();
+  f.reportViewport();
+  assert.equal(surface.classList.contains('ignore-browser-zoom'), false);
+  assert.equal(surface.style.transform, undefined);
+  assert.deepEqual(ws.sent.filter(m => m.type === 'viewport').at(-1), { type: 'viewport', width: 960, height: 336 });
+});
+
+test('unsupported viewport shapes never reach Android as invalid control messages', async () => {
+  const f = fixture({ storedIgnoreZoom: 'true', geometry: { width: 960, height: 400, top: 64 },
+    visual: { width: 960, height: 400, scale: 1, offsetLeft: 0, offsetTop: 0 } });
+  const ws = await f.connect(); f.reportViewport();
+  const count = ws.sent.filter(m => m.type === 'viewport').length;
+  Object.assign(f.visualViewport, { height: 100 });
+  f.visualEvents.resize(); f.reportViewport();
+  assert.equal(ws.sent.filter(m => m.type === 'viewport').length, count);
+  assert.equal(ws.readyState, 1);
 });

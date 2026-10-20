@@ -9,6 +9,8 @@ import org.json.JSONObject
 internal object BrowserStrings {
     private val resources =
         mapOf(
+            "web_ignore_browser_zoom" to UiR.string.web_ignore_browser_zoom,
+            "web_ignore_browser_zoom_help" to UiR.string.web_ignore_browser_zoom_help,
             "web_browser_paired" to UiR.string.web_browser_paired,
             "web_start_display" to UiR.string.web_start_display,
             "web_paired_ready_to_start" to UiR.string.web_paired_ready_to_start,

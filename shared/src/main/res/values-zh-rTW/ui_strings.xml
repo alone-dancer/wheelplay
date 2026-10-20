@@ -541,4 +541,6 @@
     <string name="ui_nband">\n頻段：</string>
     <string name="ui_your_iphone">你的 iPhone</string>
     <string name="ui_stopped">已停止</string>
+    <string name="web_ignore_browser_zoom">忽略瀏覽器縮放</string>
+    <string name="web_ignore_browser_zoom_help">瀏覽器縮放變化時，讓 CarPlay 畫面保持適配可見區域。此瀏覽器會記住選擇。</string>
 </resources>
