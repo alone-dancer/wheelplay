@@ -96,7 +96,7 @@ export function createPresentationController({
     status(meta) {
       if (!accept(meta)) return false;
       // Compatibility with servers predating versioned media packets.
-      if (videoEpoch === null && frame && (meta.width !== frame.width || meta.height !== frame.height)) {
+      if (videoEpoch === null && frame && frame.transport !== 'rtc' && (meta.width !== frame.width || meta.height !== frame.height)) {
         revision++; invalid = false;
       }
       source = meta.sourceState || (meta.streaming ? 'ready' : 'recovering');
@@ -139,19 +139,30 @@ export function decodeVideoPacket(buffer) {
   return { ...packet, protocol, mime: format === 2 ? 'image/webp' : 'image/jpeg', jpeg: buffer.slice(headerBytes) };
 }
 
-export function probeWebp({ createImage = () => new Image(), schedule = setTimeout, cancel = clearTimeout } = {}) {
+export function probeWebp({ createImage = () => new Image(), schedule = setTimeout, cancel = clearTimeout,
+  createUrl = data => URL.createObjectURL(data), revokeUrl = url => URL.revokeObjectURL(url),
+} = {}) {
   return new Promise(resolve => {
-    let image, timer = null, finished = false;
+    let image, url = null, timer = null, finished = false;
     const finish = supported => {
       if (finished) return; finished = true; cancel(timer);
       if (image) { image.onload = image.onerror = null; image.removeAttribute('src'); }
+      if (url !== null) revokeUrl(url);
       resolve(supported);
     };
     try {
       image = createImage(); timer = schedule(() => finish(false), 1500);
       image.onload = () => finish(image.naturalWidth === 2 && image.naturalHeight === 2);
       image.onerror = () => finish(false);
-      image.src = 'data:image/webp;base64,UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAIAAgA0JaACdLoB+AADsAD+8MQL/yC5YXXI1/8gP+QH/ID/+PIAAAA=';
+      // The Android page allows blob: images but deliberately blocks data: URLs.
+      // This is the same 2x2 WebP fixture used by the capability probe.
+      url = createUrl(new Blob([new Uint8Array([
+        82, 73, 70, 70, 60, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 48, 0, 0, 0,
+        208, 1, 0, 157, 1, 42, 2, 0, 2, 0, 2, 0, 52, 37, 160, 2, 116, 186, 1, 248,
+        0, 3, 176, 0, 254, 240, 196, 11, 255, 32, 185, 97, 117, 200, 215, 255, 32,
+        63, 228, 7, 252, 128, 255, 248, 242, 0, 0, 0,
+      ])], { type: 'image/webp' }));
+      image.src = url;
     } catch (_) { finish(false); }
   });
 }
@@ -285,7 +296,7 @@ export function createControlOutbox(socket, {
 // suppress video frame callbacks on embedded browsers. drawImage copies decoded
 // frames directly; it does not read pixels back through getImageData.
 export function createVideoCanvasRenderer(video, canvas, {
-  onFrame = () => {}, onError = () => {},
+  onFrame = () => {}, onDraw = () => {}, onError = () => {},
   requestFrame = callback => requestAnimationFrame(callback), cancelFrame = id => cancelAnimationFrame(id),
   now = () => performance.now(),
 } = {}) {
@@ -317,6 +328,7 @@ export function createVideoCanvasRenderer(video, canvas, {
       if (!resized && key !== null && key === lastFrameKey) return;
       if (resized) { canvas.width = width; canvas.height = height; }
       context.drawImage(video, 0, 0, width, height);
+      onDraw();
       lastFrameKey = key;
       const first = canvas.hidden;
       canvas.hidden = false;
@@ -356,10 +368,137 @@ function isRtcErrorRetryable(error) {
   return !['NotAllowedError', 'NotSupportedError'].includes(error?.name);
 }
 
+export function videoRendererPreference(value, legacy) {
+  return ['native', 'video-canvas', 'track-canvas'].includes(value) ? value : legacy === 'true' ? 'video-canvas' : 'native';
+}
+
+// A reader owns each VideoFrame until it is drawn or discarded, including after stop.
+export function createTrackCanvasRenderer(canvas, {
+  onReady = () => {}, onResize = () => {}, onError = () => {},
+  createProcessor = init => new MediaStreamTrackProcessor(init),
+} = {}) {
+  let generation = 0, reader = null, running = false, width = 0, height = 0, renderedFrames = 0;
+  function stop() {
+    generation++; running = false;
+    const old = reader; reader = null;
+    if (old) { try { Promise.resolve(old.cancel()).catch(() => {}); } catch (_) {} }
+    canvas.hidden = true; canvas.width = canvas.height = 0;
+  }
+  async function consume(activeReader, context, token) {
+    const current = () => running && generation === token;
+    try {
+      while (current()) {
+        const { value: frame, done } = await activeReader.read();
+        try {
+          if (!current()) break;
+          if (done) throw new Error('track-ended');
+          if (!frame || !(frame.displayWidth > 0) || !(frame.displayHeight > 0)) continue;
+          const resized = width !== frame.displayWidth || height !== frame.displayHeight;
+          if (resized) { canvas.width = frame.displayWidth; canvas.height = frame.displayHeight; }
+          context.drawImage(frame, 0, 0, frame.displayWidth, frame.displayHeight);
+          width = frame.displayWidth; height = frame.displayHeight; renderedFrames++;
+          canvas.hidden = false;
+          if (renderedFrames === 1) onReady({ width, height });
+          else if (resized) onResize({ width, height });
+        } finally { frame?.close(); }
+      }
+    } catch (error) {
+      if (current()) {
+        // Let the receiver freeze the last picture before stop clears the canvas.
+        try { onError(error.message === 'track-ended' ? 'track-ended' : 'renderer-error', isRtcErrorRetryable(error)); }
+        finally { if (generation === token) stop(); }
+      }
+    } finally {
+      try { activeReader.releaseLock(); } catch (_) {}
+      if (reader === activeReader) reader = null;
+    }
+  }
+  return {
+    start(track) {
+      stop(); width = height = renderedFrames = 0;
+      try {
+        const context = canvas.getContext('2d', { alpha: false });
+        if (!context) throw Object.assign(new Error('Canvas 2D unavailable'), { name: 'NotSupportedError' });
+        reader = createProcessor({ track, maxBufferSize: 1 }).readable.getReader();
+        running = true;
+        void consume(reader, context, generation);
+      } catch (error) { stop(); onError('renderer-error', isRtcErrorRetryable(error)); }
+    },
+    stop,
+    snapshot: () => ({ width, height, renderedFrames, presentedFrames: null }),
+  };
+}
+
+// Video elements exist only for the two legacy renderers, and belong to one offer.
+export function createVideoRenderer(mode, canvas, {
+  createVideo, onReady = () => {}, onResize = () => {}, onError = () => {},
+} = {}) {
+  let video = null, copy = null, frameCallback = null, generation = 0, ready = false, started = false;
+  let width = 0, height = 0, presentedFrames = null, renderedFrames = mode === 'video-canvas' ? 0 : null;
+  function report(w, h) {
+    if (!video || !w || !h) return;
+    const resized = width !== w || height !== h;
+    width = w; height = h;
+    if (!ready) { ready = true; if (!copy) video.hidden = false; onReady({ width, height }); }
+    else if (resized) onResize({ width, height });
+  }
+  function stop() {
+    generation++;
+    if (copy) copy.stop(); copy = null;
+    if (video) {
+      if (frameCallback !== null) video.cancelVideoFrameCallback?.(frameCallback);
+      video.onloadeddata = video.onerror = video.onresize = null;
+      video.srcObject = null; video.remove(); video = null;
+    }
+    frameCallback = null;
+  }
+  return {
+    start(track, streams = []) {
+      stop(); ready = started = false; width = height = 0; presentedFrames = null;
+      renderedFrames = mode === 'video-canvas' ? 0 : null;
+      try {
+        video = createVideo();
+        const token = generation, current = () => video !== null && token === generation;
+        if (mode === 'video-canvas') {
+          copy = createVideoCanvasRenderer(video, canvas, {
+            onDraw: () => { renderedFrames++; }, onFrame: report,
+            onError: error => { if (current()) onError('renderer-error', isRtcErrorRetryable(error)); },
+          });
+          copy.prepare();
+        }
+        const displayed = () => {
+          if (!current() || video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
+          if (copy) { if (!started) { started = true; copy.start(); } }
+          else report(video.videoWidth, video.videoHeight);
+        };
+        video.onloadeddata = displayed;
+        video.onresize = () => { if (current() && !copy) displayed(); };
+        video.onerror = () => { if (current()) onError('renderer-error'); };
+        if (video.requestVideoFrameCallback) {
+          let firstPresented = null;
+          presentedFrames = 0;
+          const observe = (_, metadata) => {
+            if (!current()) return;
+            if (firstPresented === null) firstPresented = metadata.presentedFrames;
+            presentedFrames = metadata.presentedFrames - firstPresented;
+            if (!copy) displayed();
+            if (current()) frameCallback = video.requestVideoFrameCallback(observe);
+          };
+          frameCallback = video.requestVideoFrameCallback(observe);
+        }
+        video.srcObject = streams[0] || new MediaStream([track]);
+        Promise.resolve(video.play()).then(displayed).catch(error => { if (current()) onError('renderer-error', isRtcErrorRetryable(error)); });
+      } catch (error) { onError('renderer-error', isRtcErrorRetryable(error)); }
+    },
+    stop,
+    snapshot: () => ({ width, height, presentedFrames, renderedFrames }),
+  };
+}
+
 // Video WebRTC remains receive-only. Browser audio uses the paired WebSocket.
-export function createRtcReceiver(video, {
+export function createRtcReceiver(createRenderer, {
   send, onReady = () => {}, onStop = () => {}, onStats = () => {},
-  onTrack = () => {}, onReset = () => {},
+  onResize = () => {}, onReset = () => {},
   createPeer = () => new RTCPeerConnection({ iceServers: [] }),
   supportsCodec = codec => {
     if (typeof RTCRtpReceiver === 'undefined' || !RTCRtpReceiver.getCapabilities) return true;
@@ -368,7 +507,7 @@ export function createRtcReceiver(video, {
   },
   schedule = setTimeout, cancel = clearTimeout, now = () => Date.now(),
 } = {}) {
-  let frameCallback = null, presented = 0, previousStats = null;
+  let renderer = null, track = null, previousStats = null, renderStalledSince = null, lastRendered = 0;
   let codec = 'H264';
   let peer = null, id = null, generation = 0, timeout = null, statsTimer = null, ready = false;
   let lastDecoded = 0, sent = 0, lastSentAt = 0, sentAtLastProgress = 0;
@@ -377,37 +516,39 @@ export function createRtcReceiver(video, {
     generation++; cancel(timeout); cancel(statsTimer); cancel(disconnectTimer);
     timeout = null; statsTimer = null; disconnectTimer = null;
     stalledSince = null; statsFailedSince = null;
+    renderStalledSince = null;
     const old = peer; peer = null; ready = false; id = null;
-    if (frameCallback !== null && video.cancelVideoFrameCallback) video.cancelVideoFrameCallback(frameCallback);
-    frameCallback = null; presented = 0; previousStats = null;
-    video.onloadeddata = null; video.onerror = null;
-    if (old) { old.ontrack = null; old.onconnectionstatechange = null; old.close(); }
     onReset();
-    video.srcObject = null; video.hidden = true;
+    if (renderer) renderer.stop(); renderer = null;
+    if (track) { track.onended = null; track.stop(); track = null; }
+    previousStats = null; lastRendered = 0;
+    if (old) { old.ontrack = old.onconnectionstatechange = old.onicegatheringstatechange = null; old.close(); }
   }
-  function fallback(retryable = true) {
+  function fallback(reason = 'connection-failed', retryable = true) {
     const current = id;
-    close(); onStop();
-    if (current !== null) send({ type: 'rtc-fallback', id: current, ...(retryable ? {} : { retryable: false }) });
+    if (current === null) return;
+    close(); onStop(reason);
+    send({ type: 'rtc-fallback', id: current, ...(retryable ? {} : { retryable: false }) });
   }
   async function receive(message) {
     if (message.type === 'rtc-stop') {
-      if (message.id === id) { close(); onStop(); }
+      if (message.id === id) { close(); onStop('server-stop'); }
       return;
     }
     if (message.type !== 'rtc-offer') return;
     close(); id = message.id; codec = message.codec === 'H265' ? 'H265' : 'H264';
     recoveryGraceMs = [4000, 10000, 30000].includes(message.recoveryGraceMs) ? message.recoveryGraceMs : 10000;
     const token = generation, current = () => generation === token && peer !== null;
-    timeout = schedule(() => { if (generation === token) fallback(); }, Math.max(10000, recoveryGraceMs));
+    timeout = schedule(() => { if (generation === token) fallback('first-frame-timeout'); }, Math.max(10000, recoveryGraceMs));
     try {
-      if (!supportsCodec(codec)) { fallback(false); return; }
+      if (!supportsCodec(codec)) { fallback('codec-unsupported', false); return; }
       const pc = createPeer(); peer = pc;
-      const displayed = () => {
-        if (!current() || ready || !video.videoWidth || video.readyState < 2) return;
+      const displayed = size => {
+        if (!current() || ready || !size.width || !size.height) return;
         ready = true; cancel(timeout); timeout = null;
         lastDecoded = 0; sent = 0; sentAtLastProgress = 0; lastSentAt = now();
-        send({ type: 'rtc-ready', id }); onReady();
+        lastRendered = renderer?.snapshot().renderedFrames ?? 0;
+        send({ type: 'rtc-ready', id }); onReady(size);
         if (current()) statsTimer = schedule(sample, 1000);
       };
       const sample = async () => {
@@ -417,8 +558,16 @@ export function createRtcReceiver(video, {
           if (!current()) return;
           statsFailedSince = null;
           report.forEach(stat => {
+            if (!current()) return;
             if (stat.type !== 'inbound-rtp' || (stat.kind || stat.mediaType) !== 'video') return;
             const decoded = stat.framesDecoded || 0, at = now();
+            const output = renderer.snapshot();
+            const presented = output.presentedFrames;
+            const rendered = output.renderedFrames;
+            if (rendered === null || rendered !== lastRendered || sent <= sentAtLastProgress || at - lastSentAt >= 2000) {
+              renderStalledSince = null;
+            } else if (renderStalledSince === null) renderStalledSince = at;
+            lastRendered = rendered;
             if (decoded !== lastDecoded || sent <= sentAtLastProgress || at - lastSentAt >= 2000) {
               stalledSince = null; sentAtLastProgress = sent;
             } else if (stalledSince === null) stalledSince = at;
@@ -434,7 +583,9 @@ export function createRtcReceiver(video, {
             });
             const metrics = {
               receivedFps: rate('framesReceived'), decodedFps: rate('framesDecoded'),
-              presentedFps: video.requestVideoFrameCallback && elapsed ? Math.max(0, presented - previous.presented) * 1000 / elapsed : null,
+              presentedFps: presented !== null && previous?.presented !== null && elapsed ? Math.max(0, presented - previous.presented) * 1000 / elapsed : null,
+              renderedFps: rendered !== null && previous?.rendered !== null && elapsed ? Math.max(0, rendered - previous.rendered) * 1000 / elapsed : null,
+              renderedFrames: rendered,
               decodeMs: averageMs('totalDecodeTime', 'framesDecoded'),
               jitterBufferMs: averageMs('jitterBufferDelay', 'jitterBufferEmittedCount'),
               processingMs: averageMs('totalProcessingDelay', 'framesDecoded'),
@@ -443,21 +594,28 @@ export function createRtcReceiver(video, {
               rttMs,
             };
             onStats(metrics.presentedFps ?? metrics.decodedFps, metrics);
+            if (!current()) return;
             send({ type: 'rtc-feedback', id, packets: Math.max(0, stat.packetsReceived || 0),
               lost: Math.max(0, stat.packetsLost || 0), decoded, nack: Math.max(0, stat.nackCount || 0), rttMs });
-            previousStats = { at, stat, presented };
+            previousStats = { at, stat, presented, rendered };
             lastDecoded = decoded;
             // Static CarPlay screens legitimately stop producing frames.
-            if (stalledSince !== null && at - stalledSince >= recoveryGraceMs) fallback();
+            if (stalledSince !== null && at - stalledSince >= recoveryGraceMs) fallback('decode-stalled');
+            else if (renderStalledSince !== null && at - renderStalledSince >= recoveryGraceMs) fallback('render-stalled');
           });
         } catch (_) {
           if (current()) {
             if (statsFailedSince === null) statsFailedSince = now();
-            if (now() - statsFailedSince >= recoveryGraceMs) fallback();
+            if (now() - statsFailedSince >= recoveryGraceMs) fallback('stats-unavailable');
           }
         }
         if (current()) statsTimer = schedule(sample, 1000);
       };
+      renderer = createRenderer({
+        onReady: displayed,
+        onResize: size => { if (current()) onResize(size); },
+        onError: (reason, retryable) => { if (current()) fallback(reason, retryable); },
+      });
       pc.onconnectionstatechange = () => {
         if (!current()) return;
         if (['failed', 'closed'].includes(pc.connectionState)) { fallback(); return; }
@@ -474,30 +632,16 @@ export function createRtcReceiver(video, {
       };
       pc.ontrack = event => {
         if (!current()) return;
-        video.onloadeddata = displayed;
-        video.onerror = () => { if (current()) fallback(); };
-        if (video.requestVideoFrameCallback && frameCallback === null) {
-          let firstPresented = null;
-          const observe = (_, metadata) => {
-            if (!current()) return;
-            if (firstPresented === null) firstPresented = metadata.presentedFrames;
-            presented = metadata.presentedFrames - firstPresented;
-            frameCallback = video.requestVideoFrameCallback(observe);
-          };
-          frameCallback = video.requestVideoFrameCallback(observe);
-        }
-        video.srcObject = event.streams[0] || new MediaStream([event.track]);
-        onTrack();
-        if (!current()) return;
-        video.play().then(displayed).catch(error => {
-          if (current()) fallback(isRtcErrorRetryable(error));
-        });
+        if (track) { fallback('track-replaced'); return; }
+        track = event.track;
+        track.onended = () => { if (current()) fallback('track-ended'); };
+        renderer.start(track, event.streams);
       };
       await pc.setRemoteDescription({ type: 'offer', sdp: message.sdp });
       if (!current()) return;
       const answer = await pc.createAnswer();
       if (!current()) return;
-      if (/^m=video 0(?: |\r?$)/m.test(answer.sdp)) { fallback(false); return; }
+      if (/^m=video 0(?: |\r?$)/m.test(answer.sdp)) { fallback('codec-unsupported', false); return; }
       // Use the browser as DTLS server: Mbed TLS 3.6 cannot reassemble a fragmented
       // ClientHello from newer Chrome versions. Passive is a standard answer role.
       await pc.setLocalDescription({ type: answer.type, sdp: answer.sdp.replace(/a=setup:active/g, 'a=setup:passive') });
@@ -510,14 +654,15 @@ export function createRtcReceiver(video, {
       if (pc.iceGatheringState === 'complete') answerReady();
       else pc.onicegatheringstatechange = answerReady;
     } catch (error) {
-      if (generation === token) fallback(isRtcErrorRetryable(error));
+      if (generation === token) fallback(error.message === 'processor-unsupported' ? error.message : 'connection-failed',
+        error.message !== 'processor-unsupported' && isRtcErrorRetryable(error));
     }
   }
   return { receive, close, fallback, get active() { return ready; }, get codec() { return codec; },
-    get recovering() { return ready && (disconnectTimer !== null || stalledSince !== null || statsFailedSince !== null); },
+    get recovering() { return ready && (disconnectTimer !== null || stalledSince !== null || renderStalledSince !== null || statsFailedSince !== null); },
     progress(count) {
       if (count > sent) {
-        if (now() - lastSentAt >= 2000) stalledSince = null;
+        if (now() - lastSentAt >= 2000) { stalledSince = null; renderStalledSince = null; }
         lastSentAt = now();
       }
       sent = count;
@@ -532,12 +677,13 @@ if (typeof document !== 'undefined') {
   const screen = $('screen');
   const screens = [screen, $('screen-next'), $('screen-third')];
   const heldFrame = $('held-frame');
-  const video = $('video');
+  let video = null;
   const canvas = $('video-canvas');
   const display = $('display');
   const touchSurface = $('touch-surface');
   // Read-only diagnostic snapshots; counters never include pairing credentials or video payloads.
-  const performanceStats = { source: null, transport: null, receiver: null, image: null };
+  const rendererStats = { selectedMode: 'native', activeMode: 'waiting', renderedFps: null, renderedFrames: null, fallbackReason: null };
+  const performanceStats = { source: null, transport: null, receiver: null, image: null, presentation: rendererStats };
   const webpSupport = probeWebp();
   Object.defineProperty(window, 'wheelplayStats', { configurable: true, get: () => JSON.parse(JSON.stringify(performanceStats)) });
   let rtc = null, rtcRequested = false, rtcFps = null;
@@ -584,19 +730,41 @@ if (typeof document !== 'undefined') {
       if (!jpeg.current) presentation.invalidate('jpeg');
     },
   });
-  const canvasOption = $('canvas-video');
-  const canvasPreference = 'wheelplay.canvasVideo';
-  try { canvasOption.checked = window.localStorage.getItem(canvasPreference) === 'true'; } catch (_) {}
-  canvasOption.addEventListener('change', () => {
-    try { window.localStorage.setItem(canvasPreference, String(canvasOption.checked)); } catch (_) {}
-  });
-  const canvasRenderer = createVideoCanvasRenderer(video, canvas, {
-    onFrame: (frameWidth, frameHeight) => {
-      if (!presentation.present(rtcMedia, frameWidth, frameHeight, 'rtc', rtcMedia.revision)) return;
-      width = frameWidth; height = frameHeight; jpeg.cancelPending(); jpeg.hide(); clearHeldFrame();
-    },
-    onError: error => { if (rtc) rtc.fallback(isRtcErrorRetryable(error)); },
-  });
+  const rendererPreference = 'wheelplay.videoRenderer';
+  let selectedMode = 'native';
+  try {
+    selectedMode = videoRendererPreference(window.localStorage.getItem(rendererPreference), window.localStorage.getItem('wheelplay.canvasVideo'));
+    window.localStorage.setItem(rendererPreference, selectedMode);
+  } catch (_) {}
+  let launchMode = selectedMode;
+  const processorSupported = () => typeof MediaStreamTrackProcessor === 'function';
+  function updateRendererOptions() {
+    for (const mode of ['native', 'video-canvas', 'track-canvas']) {
+      $(`renderer-${mode}`).checked = selectedMode === mode;
+      $(`renderer-${mode}-card`).classList.toggle('selected', selectedMode === mode);
+    }
+    $('renderer-hint').hidden = selectedMode !== 'track-canvas' || processorSupported();
+  }
+  for (const mode of ['native', 'video-canvas', 'track-canvas']) {
+    $(`renderer-${mode}`).addEventListener('change', () => {
+      if (!$(`renderer-${mode}`).checked) return;
+      selectedMode = mode; updateRendererOptions();
+      try { window.localStorage.setItem(rendererPreference, mode); } catch (_) {}
+    });
+  }
+  updateRendererOptions();
+  function createLegacyVideo() {
+    video = document.createElement('video');
+    video.id = 'video'; video.autoplay = true; video.muted = true; video.playsInline = true; video.hidden = true;
+    video.setAttribute('disablepictureinpicture', '');
+    video.setAttribute('aria-label', t('web_live_carplay_video'));
+    display.insertBefore(video, canvas); bindSurface(video);
+    return video;
+  }
+  function showRtcSize(size) {
+    if (!presentation.present(rtcMedia, size.width, size.height, 'rtc', rtcMedia.revision)) return;
+    width = size.width; height = size.height; jpeg.cancelPending(); jpeg.hide(); clearHeldFrame();
+  }
   const pairApi = async (path, request = null) => {
     const headers = request?.token ? { 'X-Pair-Token': request.token } :
       request?.code ? { 'X-Pair-Code': request.code } :
@@ -813,11 +981,15 @@ if (typeof document !== 'undefined') {
   function release() { cancelMove(); pointers.clear(); send({ type: 'touch', contacts: [] }); }
   function renderPresentation(value) {
     live = value.interactive;
-    for (const surface of [...screens, video, canvas, heldFrame]) surface.classList.toggle('stale', !value.visible);
+    for (const surface of [...screens, video, canvas, heldFrame].filter(Boolean)) surface.classList.toggle('stale', !value.visible);
     touchSurface.classList.toggle('stale', !live);
     $('waiting').hidden = value.visible;
     if (!live && pointers.size) release();
-    const transport = rtc && (rtc.active || value.frame?.transport === 'rtc') ? `${rtc.codec === 'H265' ? 'HEVC' : 'H.264'} / WebRTC${canvasOption.checked ? ' / Canvas' : ''}${rtcFps === null ? '' : ` · ${rtcFps} fps`}` : value.frame?.mime === 'image/webp' ? 'WebP' : 'JPEG';
+    const rtcVisible = rtc && value.visible && value.frame?.transport === 'rtc';
+    rendererStats.activeMode = rtcVisible ? launchMode : value.visible ? 'jpeg' : 'waiting';
+    const rendererLabel = launchMode === 'native' ? 'Video' : t(launchMode === 'video-canvas' ? 'web_video_renderer_compat' : 'web_video_renderer_direct');
+    const fallbackLabel = rendererStats.fallbackReason ? t(rendererStats.fallbackReason === 'processor-unsupported' ? 'web_video_renderer_unavailable' : 'web_video_renderer_failed') : '';
+    const transport = rtcVisible ? `${rtc.codec === 'H265' ? 'HEVC' : 'H.264'} / WebRTC / ${rendererLabel}${rtcFps === null ? '' : ` · ${rtcFps} fps`}` : `${value.frame?.mime === 'image/webp' ? 'WebP' : 'JPEG'}${fallbackLabel}`;
     $('status').textContent = value.state === 'recovering' ? t('web_video_recovering', transport) :
       value.visible ? value.interactive ? t('web_transport_touch_connected', transport, rtc?.recovering ? t('web_waiting_for_recovery') : '') :
         t('web_video_input_unavailable', transport) : t('web_connected_waiting_for_iphone_video');
@@ -842,9 +1014,9 @@ if (typeof document !== 'undefined') {
   }
   function cleanupRtc() {
     if (rtc) rtc.close(); rtc = null; rtcRequested = false; rtcFps = null;
-    canvasRenderer.stop();
+    video = null;
     performanceStats.source = performanceStats.transport = performanceStats.receiver = performanceStats.image = null;
-    video.hidden = true;
+    rendererStats.activeMode = 'waiting';
   }
   function exitLaunchFullscreen() {
     try { Promise.resolve(document.exitFullscreen()).catch(() => {}); } catch (_) {}
@@ -890,7 +1062,7 @@ if (typeof document !== 'undefined') {
     const auth = pairingToken ? `token=${encodeURIComponent(pairingToken)}` : `code=${encodeURIComponent($('code').value)}`;
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/stream?${auth}&media=2&images=3`);
     ws.binaryType = 'arraybuffer';
-    const useCanvas = canvasOption.checked;
+    const mode = launchMode;
     socket = ws;
     const connectTimer = setTimeout(() => ws.close(), 8000);
     ws.onopen = () => {
@@ -908,21 +1080,34 @@ if (typeof document !== 'undefined') {
       webpSupport.then(supported => {
         if (supported && socket === ws && ws.readyState === WebSocket.OPEN) send({ type: 'image-format', format: 'webp' });
       });
-      rtc = createRtcReceiver(video, { send,
-        onTrack: () => { if (useCanvas) canvasRenderer.prepare(); },
-        onReset: () => { holdRtcFrame(); canvasRenderer.stop(); presentation.invalidate('rtc'); },
-        onReady: () => {
+      Object.assign(rendererStats, { selectedMode: mode, activeMode: 'waiting', renderedFps: null, renderedFrames: null,
+        fallbackReason: mode === 'track-canvas' && !processorSupported() ? 'processor-unsupported' : null });
+      rtc = createRtcReceiver(callbacks => {
+        if (mode === 'track-canvas') {
+          if (!processorSupported()) throw new Error('processor-unsupported');
+          return createTrackCanvasRenderer(canvas, callbacks);
+        }
+        return createVideoRenderer(mode, canvas, { ...callbacks, createVideo: createLegacyVideo });
+      }, { send,
+        onReset: () => { holdRtcFrame(); presentation.invalidate('rtc'); },
+        onResize: size => { if (socket === ws) showRtcSize(size); },
+        onReady: size => {
           if (socket !== ws) return;
-          if (useCanvas) { canvasRenderer.start(); return; }
-          if (!presentation.present(rtcMedia, video.videoWidth, video.videoHeight, 'rtc', rtcMedia.revision)) return;
-          jpeg.cancelPending(); jpeg.hide(); clearHeldFrame(); video.hidden = false;
-          width = video.videoWidth; height = video.videoHeight;
+          rendererStats.activeMode = mode; rendererStats.fallbackReason = null;
+          rendererStats.renderedFrames = mode === 'native' ? null : 1;
+          showRtcSize(size);
         },
-        onStop: () => {
+        onStop: reason => {
           if (socket !== ws) return;
-          video.hidden = true; rtcFps = null; presentation.invalidate('rtc');
+          video = null; rtcFps = null; rendererStats.fallbackReason = reason; rendererStats.renderedFps = null;
+          presentation.invalidate('rtc');
         },
-        onStats: (fps, metrics) => { rtcFps = fps === null ? null : Math.round(fps); performanceStats.receiver = metrics; },
+        onStats: (fps, metrics) => {
+          const outputFps = mode === 'track-canvas' ? metrics.renderedFps : fps;
+          rtcFps = outputFps === null ? null : Math.round(outputFps); performanceStats.receiver = metrics;
+          rendererStats.renderedFps = metrics.renderedFps; rendererStats.renderedFrames = metrics.renderedFrames;
+          presentation.refresh();
+        },
       });
       $('message').textContent = '';
       $('phone-connect').disabled = false;
@@ -977,7 +1162,8 @@ if (typeof document !== 'undefined') {
           }
           $('stage').textContent = data.stage || t("web_waiting_for_iphone_video");
           rtc.progress(data.rtcFrames || 0);
-          if (data.rtcAvailable && !rtcRequested && !rtc.active && typeof RTCPeerConnection !== 'undefined') {
+          if (data.rtcAvailable && !rtcRequested && !rtc.active && typeof RTCPeerConnection !== 'undefined' &&
+              (mode !== 'track-canvas' || processorSupported())) {
             rtcRequested = true; send({ type: 'rtc-start' });
           }
           // The server resets availability when the iPhone starts a new video configuration.
@@ -1040,6 +1226,7 @@ if (typeof document !== 'undefined') {
   }
   $('connect-form').addEventListener('submit', event => {
     event.preventDefault();
+    launchMode = selectedMode;
     const generation = ++authGeneration;
     prepareLaunchPresentation();
     stopQr(); $('connect').disabled = true; $('message').textContent = '';
@@ -1097,7 +1284,7 @@ if (typeof document !== 'undefined') {
     scheduleViewportReport();
   });
   // A separate layer prevents Android Chrome's native video gestures cancelling drags.
-  for (const surface of [...screens, video, canvas, touchSurface]) {
+  function bindSurface(surface) {
   surface.addEventListener('contextmenu', event => event.preventDefault());
   surface.addEventListener('pointerdown', event => {
     if (!live || pointers.size >= 2 || (event.pointerType === 'mouse' && event.button !== 0)) return;
@@ -1135,6 +1322,7 @@ if (typeof document !== 'undefined') {
   surface.addEventListener('pointercancel', up);
   surface.addEventListener('lostpointercapture', up);
   }
+  for (const surface of [...screens, canvas, touchSurface]) bindSurface(surface);
   window.addEventListener('blur', release);
   document.addEventListener('visibilitychange', () => { if (document.hidden) release(); presentation.refresh(); });
   window.addEventListener('pagehide', () => disconnect(false));

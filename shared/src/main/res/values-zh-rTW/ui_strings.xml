@@ -545,4 +545,16 @@
     <string name="web_ignore_browser_zoom_help">瀏覽器縮放變化時，讓 CarPlay 畫面保持適配可見區域。此瀏覽器會記住選擇。</string>
     <string name="web_video_recovering">%1$s · 等待恢復 · 觸控已暫停</string>
     <string name="web_video_input_unavailable">%1$s · 等待觸控輸入</string>
+
+    <string name="web_video_renderer_title">影片顯示方式</string>
+    <string name="web_video_renderer_native">原生 Video</string>
+    <string name="web_video_renderer_native_description">預設方式，直接顯示影片。</string>
+    <string name="web_video_renderer_compat">相容 Canvas</string>
+    <string name="web_video_renderer_compat_description">使用離螢幕影片解碼，再繪製到畫布。</string>
+    <string name="web_video_renderer_direct">直接 Canvas</string>
+    <string name="web_video_renderer_direct_description">不使用影片元素；不支援時使用 JPEG / WebP。</string>
+    <string name="web_video_renderer_experimental">實驗性</string>
+    <string name="web_video_renderer_hint">此瀏覽器不支援直接 Canvas，連線後將使用 JPEG / WebP。</string>
+    <string name="web_video_renderer_unavailable">（直接 Canvas 無法使用，已使用 JPEG / WebP）</string>
+    <string name="web_video_renderer_failed">（影片中斷，已改用 JPEG / WebP）</string>
 </resources>

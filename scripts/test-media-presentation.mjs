@@ -12,6 +12,8 @@ import { resourceStrings, renderBrowserTemplate } from './resource-strings.mjs';
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const messages = resourceStrings('values-zh-rCN');
 const root = new URL('../common/src/main/assets/web/', import.meta.url);
+const androidServer = await readFile(new URL('../common/src/main/java/com/shilapi/xcertplay/web/LanWebServer.kt', import.meta.url), 'utf8');
+const csp = androidServer.match(/"(default-src 'self';[^"\n]+)"/)[1];
 const profile = await mkdtemp(join(tmpdir(), 'wheelplay-media-'));
 function image(width, height, codec = 'mjpeg') {
   const result = spawnSync(ffmpeg, ['-v', 'error', '-f', 'lavfi', '-i', `testsrc=size=${width}x${height}:rate=1`,
@@ -25,6 +27,7 @@ const touches = [], errors = [];
 let media = { type: 'status', mediaProtocol: 3, sessionId: 7, videoEpoch: 1, width: 320, height: 180,
   sourceState: 'ready', inputReady: true, streaming: true, stage: 'Synthetic browser test' };
 const server = http.createServer(async (req, res) => {
+  res.setHeader('Content-Security-Policy', csp);
   if (req.url.startsWith('/pair/')) {
     const result = req.url === '/pair/remember' ? { id: 'd'.repeat(32), secret: 's'.repeat(32), name: 'Test' } :
       req.url === '/pair/request' ? { id: 'qr', secret: 'poll', expiresIn: 120 } :

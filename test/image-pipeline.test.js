@@ -5,13 +5,18 @@ import { createJpegPresenter, createControlOutbox, decodeVideoPacket, probeWebp 
 test('WebP probe checks decoded dimensions and cleans up on success, failure and timeout', async () => {
   for (const result of ['supported', 'wrong-size', 'error', 'timeout']) {
     const image = { naturalWidth: result === 'wrong-size' ? 0 : 2, naturalHeight: 2, removeAttribute() { delete this.src; } };
-    let deadline, cancelled;
+    let deadline, cancelled, fixture;
+    const revoked = [];
     const promise = probeWebp({ createImage: () => image,
+      createUrl: data => { fixture = data; return 'blob:webp-probe'; }, revokeUrl: url => revoked.push(url),
       schedule: fn => { deadline = fn; return 7; }, cancel: id => { cancelled = id; } });
+    assert.equal(image.src, 'blob:webp-probe'); assert.equal(fixture.type, 'image/webp');
+    assert.equal(fixture.size, 68);
     const late = image.onload;
     if (result === 'timeout') deadline(); else if (result === 'error') image.onerror(); else image.onload();
     assert.equal(await promise, result === 'supported');
     late(); assert.equal(cancelled, 7); assert.equal(image.onload, null); assert.equal(image.src, undefined);
+    assert.deepEqual(revoked, ['blob:webp-probe']);
   }
   assert.equal(await probeWebp({ createImage: () => { throw new Error('unavailable'); } }), false);
 });

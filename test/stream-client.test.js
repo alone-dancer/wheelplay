@@ -9,13 +9,14 @@ const source = readFileSync(new URL('../common/src/main/assets/web/text.js', imp
   .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
   readFileSync(new URL('../common/src/main/assets/web/app.js', import.meta.url), 'utf8')
     .replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
-function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled = false, canvasAvailable = true, supportsWebp = false,
+function fixture({ storedCanvas = null, storedMode = null, processorAvailable = true, storedIgnoreZoom = null, storageDisabled = false, canvasAvailable = true, supportsWebp = false,
   geometry = null, visual = null,
   fullscreen = 'supported', codeDenied = false, resume = () => ({ token: 'session-token', name: 'Chrome' }) } = {}) {
   const elements = new Map(), timers = new Map(), raf = new Map(), sockets = [], peers = [], draws = [];
   const preferences = new Map(storedCanvas === null ? [] : [['wheelplay.canvasVideo', storedCanvas]]);
   if (storedIgnoreZoom !== null) preferences.set('wheelplay.ignoreBrowserZoom', storedIgnoreZoom);
-  const videoCallbacks = new Map();
+  const videoCallbacks = new Map(), createdVideos = [], processors = [];
+  if (storedMode !== null) preferences.set('wheelplay.videoRenderer', storedMode);
   const documentEvents = {}, fullscreenCalls = [];
   const visualEvents = {};
   const visualViewport = visual ? { ...visual, addEventListener(type, fn) { visualEvents[type] = fn; } } : undefined;
@@ -24,7 +25,7 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
   let nextTimer = 0, nextFrame = 0, clockNow = 1000;
   const element = id => {
     const classes = new Set();
-    if (!elements.has(id)) elements.set(id, { hidden: false, value: '123456', handlers: {}, naturalWidth: 1280, naturalHeight: 720,
+    if (!elements.has(id)) elements.set(id, { hidden: id === 'video-canvas', complete: true, value: '123456', handlers: {}, naturalWidth: 1280, naturalHeight: 720,
       checked: false, videoWidth: 1280, videoHeight: 720, readyState: 2, currentTime: 0,
       style: { removeProperty(name) { delete this[name]; } },
       parentElement: { getBoundingClientRect: () => mainRect },
@@ -33,6 +34,8 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
       requestVideoFrameCallback(fn) { const frame = ++nextFrame; videoCallbacks.set(frame, fn); return frame; },
       cancelVideoFrameCallback(frame) { videoCallbacks.delete(frame); },
       classList: { toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); }, contains: name => classes.has(name) },
+      remove() { this.hidden = true; this.removed = true; },
+      insertBefore(child) { child.removed = false; },
       removeAttribute() {}, setAttribute() {}, setPointerCapture() {},
       getBoundingClientRect() {
         if (id !== 'display' || !classes.has('ignore-browser-zoom')) return mainRect;
@@ -56,7 +59,7 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
     async setLocalDescription() {}
     close() { this.closed = true; }
   }
-  const document = { getElementById: element, fullscreenElement: null, documentElement: {},
+  const document = { createElement(tag) { assert.equal(tag, 'video'); const video = element('video'); createdVideos.push(video); return video; }, getElementById: element, fullscreenElement: null, documentElement: {},
     addEventListener(name, fn) { documentEvents[name] = fn; },
     exitFullscreen() {
       fullscreenCalls.push('exit'); this.fullscreenElement = null;
@@ -78,6 +81,17 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
     },
   },
     location: { host: 'server:8080' }, URL: { createObjectURL: () => 'blob:frame', revokeObjectURL() {} }, Date, WebSocket: Socket,
+    MediaStreamTrackProcessor: processorAvailable ? class {
+      constructor(init) {
+        this.init = init; this.pending = [];
+        this.reader = {
+          read: () => new Promise(resolve => this.pending.push(resolve)),
+          cancel: () => { this.canceled = true; this.pending.splice(0).forEach(resolve => resolve({ done: true })); },
+          releaseLock: () => { this.released = true; },
+        };
+        this.readable = { getReader: () => this.reader }; processors.push(this);
+      }
+    } : undefined,
     ArrayBuffer, DataView, Blob,
     RTCPeerConnection: Peer, performance: { now: () => clockNow },
     setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay, at: clockNow + delay }); return id; },
@@ -98,7 +112,7 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
   };
   context.wheelplayMessages = messages;
   vm.runInNewContext(source, context);
-  return { element, sockets, timers, peers, draws, preferences, raf, videoCallbacks, document, fullscreenCalls, visualViewport, visualEvents,
+  return { element, sockets, timers, peers, draws, preferences, raf, videoCallbacks, document, fullscreenCalls, createdVideos, processors, visualViewport, visualEvents,
     reportViewport() {
       const [id, timer] = [...timers].find(([, t]) => t.delay === 180);
       timers.delete(id); timer.fn();
@@ -111,6 +125,13 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
         timers.delete(entry[0]); entry[1].fn();
       }
     },
+    stats: () => context.window.wheelplayStats,
+    select(mode) { element(`renderer-${mode}`).checked = true; element(`renderer-${mode}`).handlers.change(); },
+    async decoded(width = 1280, height = 720) {
+      const frame = { displayWidth: width, displayHeight: height, closes: 0, close() { this.closes++; } };
+      processors.at(-1).pending.shift()({ value: frame, done: false });
+      await new Promise(resolve => setImmediate(resolve)); return frame;
+    },
     async connect() {
       element('connect-form').handlers.submit({ preventDefault() {} });
       await new Promise(resolve => setImmediate(resolve));
@@ -120,7 +141,7 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
     async offer(ws, id = 1, meta = {}) {
       ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id, sdp: 'offer', ...meta }) });
       await new Promise(resolve => setImmediate(resolve));
-      peers.at(-1).ontrack({ streams: [{}] });
+      peers.at(-1).ontrack({ track: { stop() {} }, streams: [{}] });
       await new Promise(resolve => setImmediate(resolve));
     },
     pointer(type, x = 100, surface = 'screen') { element(surface).handlers[type]({ pointerId: 1, pointerType: 'touch', clientX: x, clientY: 100, preventDefault() {} }); },
@@ -256,14 +277,19 @@ test('pending movement is cancelled at up before another down', async () => {
   assert.deepEqual(ws.sent.filter(m => m.type === 'touch').map(m => m.contacts[0].down), [true, false, true]);
 });
 
-test('Canvas preference defaults off, persists per browser, and tolerates unavailable storage', async () => {
-  const defaults = fixture(); assert.equal(defaults.element('canvas-video').checked, false);
-  const f = fixture({ storedCanvas: 'true' }); assert.equal(f.element('canvas-video').checked, true);
-  f.element('canvas-video').checked = false; f.element('canvas-video').handlers.change();
-  assert.equal(f.preferences.get('wheelplay.canvasVideo'), 'false');
-  const denied = fixture({ storageDisabled: true });
-  denied.element('canvas-video').checked = true; denied.element('canvas-video').handlers.change();
+test('renderer defaults, legacy migration, new preference precedence and storage errors', async () => {
+  const defaults = fixture(); assert.equal(defaults.element('renderer-native').checked, true);
+  const f = fixture({ storedCanvas: 'true' }); assert.equal(f.element('renderer-video-canvas').checked, true);
+  f.select('track-canvas');
+  assert.equal(f.preferences.get('wheelplay.videoRenderer'), 'track-canvas');
+  assert.equal(f.preferences.get('wheelplay.canvasVideo'), 'true');
+  assert.equal(f.element('renderer-video-canvas').checked, false);
+  const preferred = fixture({ storedCanvas: 'true', storedMode: 'native' });
+  assert.equal(preferred.element('renderer-native').checked, true);
+  assert.equal(fixture({ storedCanvas: 'true', storedMode: 'invalid' }).element('renderer-video-canvas').checked, true);
+  const denied = fixture({ storageDisabled: true }); denied.select('track-canvas');
   assert.equal((await denied.connect()).readyState, 1);
+  assert.equal(denied.stats().presentation.selectedMode, 'track-canvas');
 });
 
 test('default WebRTC presents native video without allocating a Canvas', async () => {
@@ -301,7 +327,7 @@ test('Canvas WebRTC handles touch, late JPEG loads, and reconnection without lea
   f.pointer('pointerdown', 100, 'touch-surface'); f.pointer('pointerup', 100, 'touch-surface');
   assert.deepEqual(ws.sent.filter(m => m.type === 'touch').map(m => m.contacts[0].down), [true, false]);
   ws.onmessage({ data: JSON.stringify({ type: 'status', width: 1280, height: 720, streaming: true, rtcAvailable: true }) });
-  assert.match(f.element('status').textContent, /WebRTC \/ Canvas/);
+  assert.match(f.element('status').textContent, /WebRTC \/ 兼容 Canvas/);
   const lateFrames = [...f.videoCallbacks.values()], lateRefresh = [...f.raf.values()];
   ws.close(); assert.equal(f.element('video-canvas').hidden, true);
   assert.equal(f.videoCallbacks.size, 0); assert.equal(f.raf.size, 0);
@@ -320,10 +346,10 @@ test('Canvas failure falls back to JPEG while control and the selected preferenc
   assert.equal(f.timers.size > 0 && [...f.timers.values()].some(t => t.delay === 1000), false);
   assert.equal(ws.sent.at(-1).type, 'rtc-fallback');
   assert.equal(ws.sent.at(-1).retryable, false);
-  f.frame(ws); assert.equal(f.element('screen').hidden, false);
+  f.frame(ws); assert.equal(['screen', 'screen-next', 'screen-third'].some(id => !f.element(id).hidden), true);
   f.pointer('pointerdown', 100, 'touch-surface'); f.pointer('pointerup', 100, 'touch-surface');
   assert.equal(ws.sent.filter(m => m.type === 'touch').length, 2);
-  assert.equal(f.element('canvas-video').checked, true);
+  assert.equal(f.element('renderer-video-canvas').checked, true);
 });
 
 
@@ -507,7 +533,7 @@ test('automatic RTC retry preserves JPEG and touch until the new video frame is 
     assert.equal(ws.sent.filter(message => message.type === 'touch').at(-1).contacts[0].down, false);
     ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
     const second = f.peers.at(-1);
-    second.ontrack({ streams: [{}] }); await new Promise(resolve => setImmediate(resolve));
+    second.ontrack({ track: { stop() {} }, streams: [{}] }); await new Promise(resolve => setImmediate(resolve));
     assert.equal([f.element('screen'), f.element('screen-next')].every(image => image.hidden), true);
     assert.equal(f.element(storedCanvas ? 'video-canvas' : 'video').hidden, false);
     assert.equal(f.element('waiting').hidden, true);
@@ -631,7 +657,7 @@ test('an RTC rebuild keeps a frozen picture and rejects the previous offer and f
     const f = fixture({ storedCanvas }), ws = await f.connect(); mediaStatus(ws);
     ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 1, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
     await new Promise(resolve => setImmediate(resolve));
-    f.peers.at(-1).ontrack({ streams: [{}] }); await new Promise(resolve => setImmediate(resolve));
+    f.peers.at(-1).ontrack({ track: { stop() {} }, streams: [{}] }); await new Promise(resolve => setImmediate(resolve));
     const oldCallbacks = [...f.videoCallbacks.values()];
     mediaStatus(ws, { videoEpoch: 2 });
     assert.equal(f.element('held-frame').hidden, false);
@@ -657,4 +683,180 @@ test('stopped media immediately covers an old image and a reconnected session ne
   f.advance(2000); assert.equal(f.element('waiting').hidden, false);
   current.onmessage({ data: videoPacket(3) }); finishJpeg(f);
   assert.equal(f.element('waiting').hidden, true);
+});
+
+
+test('Direct Canvas waits for drawing and never creates Video through recovery, fallback and reconnection', async () => {
+  const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect();
+  f.frame(ws);
+  ws.onmessage({ data: {} }); const lateJpeg = f.element('screen-next').onload;
+  await f.offer(ws);
+  assert.equal(ws.sent.some(m => m.type === 'rtc-ready'), false);
+  assert.equal(f.element('screen').hidden, false);
+  const frame = await f.decoded(); assert.equal(frame.closes, 1);
+  assert.equal(ws.sent.filter(m => m.type === 'rtc-ready').length, 1);
+  lateJpeg(); assert.equal(f.element('screen').hidden, true);
+  assert.equal(f.element('video-canvas').hidden, false);
+  assert.equal(f.processors[0].init.maxBufferSize, 1);
+  const peer = f.peers.at(-1);
+  peer.connectionState = 'disconnected'; peer.onconnectionstatechange();
+  assert.equal(f.element('video-canvas').hidden, false);
+  peer.connectionState = 'connected'; peer.onconnectionstatechange();
+  f.pointer('pointerdown', 100, 'touch-surface');
+  f.processors.at(-1).pending.shift()({ done: true });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ws.readyState, 1);
+  assert.equal(f.stats().presentation.fallbackReason, 'track-ended');
+  assert.equal(f.element('video-canvas').width, 0);
+  assert.equal(ws.sent.filter(m => m.type === 'touch').at(-1).contacts.length, 0);
+  f.frame(ws); assert.equal(['screen', 'screen-next', 'screen-third'].some(id => !f.element(id).hidden), true);
+  ws.close();
+  const next = await f.connect(); await f.offer(next, 2); await f.decoded();
+  assert.equal(f.createdVideos.length, 0);
+  assert.equal(f.stats().presentation.activeMode, 'track-canvas');
+  assert.equal(f.processors[0].released, true);
+});
+
+test('unsupported Direct Canvas skips rtc-start and handles an unexpected offer without Video', async () => {
+  const f = fixture({ storedMode: 'track-canvas', processorAvailable: false }), ws = await f.connect();
+  assert.equal(f.element('renderer-hint').hidden, false);
+  for (let i = 0; i < 3; i++) ws.onmessage({ data: JSON.stringify({ type: 'status', streaming: true, rtcAvailable: true }) });
+  assert.equal(ws.sent.some(m => m.type === 'rtc-start'), false);
+  f.frame(ws);
+  assert.match(f.element('status').textContent, /直接 Canvas 不可用/);
+  ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 9, sdp: 'offer' }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(ws.sent.filter(m => m.type === 'rtc-fallback').length, 1);
+  assert.equal(f.createdVideos.length, 0);
+  assert.equal(f.preferences.get('wheelplay.videoRenderer'), 'track-canvas');
+});
+
+test('Direct Canvas resize controls touch mapping even after server status reports landscape', async () => {
+  const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect(); await f.offer(ws);
+  await f.decoded(720, 1280);
+  ws.onmessage({ data: JSON.stringify({ type: 'status', width: 1280, height: 720, streaming: true }) });
+  f.pointer('pointerdown', 100, 'touch-surface');
+  assert.equal(ws.sent.some(m => m.type === 'touch'), false, 'Pillarbox is not touchable');
+  f.pointer('pointerdown', 640, 'touch-surface');
+  assert.equal(ws.sent.filter(m => m.type === 'touch').at(-1).contacts[0].x, .5);
+  assert.equal(f.element('video-canvas').width, 720);
+  assert.equal(f.element('video-canvas').height, 1280);
+  f.pointer('pointerup', 640, 'touch-surface');
+  await f.decoded(1280, 720); f.pointer('pointerdown', 100, 'touch-surface');
+  assert.ok(ws.sent.filter(m => m.type === 'touch').at(-1).contacts[0].x < .1);
+});
+
+test('Direct Canvas drawing errors use JPEG and do not change browser audio or the connection', async () => {
+  const f = fixture({ storedMode: 'track-canvas', canvasAvailable: false }), ws = await f.connect(); await f.offer(ws);
+  assert.equal(ws.readyState, 1); assert.equal(f.createdVideos.length, 0);
+  assert.equal(f.stats().presentation.fallbackReason, 'renderer-error');
+  assert.equal(f.stats().presentation.activeMode, 'waiting');
+  assert.equal(f.element('renderer-track-canvas').checked, true);
+  f.pointer('pointerdown'); assert.equal(ws.sent.some(m => m.type === 'touch'), false);
+  f.frame(ws); f.pointer('pointerdown'); f.pointer('pointerup');
+  assert.equal(ws.sent.filter(m => m.type === 'touch').length, 2);
+});
+
+test('Direct Canvas failures freeze the last frame until the fallback image is decoded', async () => {
+  for (const failure of ['draw', 'end']) {
+    const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect();
+    const canvas = f.element('video-canvas'), held = f.element('held-frame');
+    let failDraw = false, copied = false;
+    canvas.getContext = () => ({ drawImage() { if (failDraw) throw new Error('draw failed'); } });
+    held.getContext = () => ({ drawImage(source) {
+      assert.equal(source, canvas); assert.equal(source.hidden, false);
+      assert.equal(source.width, 1280); assert.equal(source.height, 720);
+      copied = true;
+    } });
+    await f.offer(ws); await f.decoded();
+    f.pointer('pointerdown', 100, 'touch-surface');
+    if (failure === 'draw') { failDraw = true; await f.decoded(); }
+    else {
+      f.processors.at(-1).pending.shift()({ done: true });
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(copied, true); assert.equal(held.hidden, false);
+    assert.equal(canvas.width, 0); assert.equal(f.element('waiting').hidden, true);
+    assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+    assert.equal(f.processors[0].canceled, true); assert.equal(f.processors[0].released, true);
+    assert.equal(ws.sent.filter(m => m.type === 'rtc-fallback').length, 1);
+    ws.onmessage({ data: {} });
+    assert.equal(held.hidden, false, 'Keep the snapshot while the fallback image is loading');
+    [f.element('screen'), f.element('screen-next'), f.element('screen-third')].find(image => image.onload).onload();
+    assert.equal(held.hidden, true); assert.equal(held.width, 0);
+    assert.equal(f.createdVideos.length, 0);
+  }
+});
+
+test('an automatic retry keeps the launch mode until the user starts a new display session', async () => {
+  const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect();
+  f.select('native'); ws.close();
+  const retry = [...f.timers.values()].find(t => t.delay === 1000);
+  await retry.fn();
+  const replacement = f.sockets.at(-1); replacement.readyState = 1; replacement.onopen();
+  assert.equal(f.stats().presentation.selectedMode, 'track-canvas');
+  await f.offer(replacement); await f.decoded();
+  assert.equal(f.createdVideos.length, 0);
+  f.element('disconnect').handlers.click();
+  const next = await f.connect(); await f.offer(next);
+  assert.equal(f.stats().presentation.selectedMode, 'native');
+  assert.equal(f.createdVideos.length, 1);
+});
+
+test('late JPEG errors cannot close a live Canvas stream or a replacement connection', async () => {
+  const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect();
+  ws.onmessage({ data: {} }); const oldError = f.element('screen').onerror;
+  await f.offer(ws); await f.decoded();
+  oldError(); assert.equal(ws.readyState, 1);
+  ws.close(); const replacement = await f.connect();
+  oldError(); assert.equal(replacement.readyState, 1);
+  assert.equal(f.createdVideos.length, 0);
+});
+
+test('a replaced JPEG load cannot ACK or display an obsolete image in the same session', async () => {
+  const f = fixture(), ws = await f.connect();
+  ws.onmessage({ data: {} }); const oldLoad = f.element('screen').onload;
+  ws.onmessage({ data: {} });
+  f.element('screen-next').onload();
+  const before = ws.sent.length; oldLoad(); assert.equal(ws.sent.length, before);
+  assert.equal(f.element('screen-next').hidden, false);
+  assert.equal(f.element('screen').hidden, true);
+});
+
+test('Direct Canvas preserves versioned media isolation and input readiness across an RTC rebuild', async () => {
+  const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect(); mediaStatus(ws);
+  await f.offer(ws, 1, { sessionId: 7, videoEpoch: 1 }); await f.decoded();
+  f.pointer('pointerdown', 100, 'touch-surface');
+  mediaStatus(ws, { videoEpoch: 2, sourceState: 'recovering', inputReady: false });
+  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+  assert.equal(f.element('held-frame').hidden, false);
+  assert.equal(f.element('touch-surface').classList.contains('stale'), true);
+  const count = f.peers.length;
+  ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 2, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
+  assert.equal(f.peers.length, count);
+  mediaStatus(ws, { videoEpoch: 2 });
+  await f.offer(ws, 3, { sessionId: 7, videoEpoch: 2 }); await f.decoded(720, 1280);
+  assert.equal(f.element('held-frame').hidden, true);
+  assert.equal(f.element('touch-surface').classList.contains('stale'), false);
+  f.pointer('pointerdown', 640, 'touch-surface');
+  assert.equal(ws.sent.filter(m => m.type === 'touch').at(-1).videoEpoch, 2);
+  assert.equal(f.createdVideos.length, 0);
+});
+
+test('Direct Canvas retries over v3 WebP without Video and only switches after the first new draw', async () => {
+  const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect(); mediaStatus(ws);
+  await f.offer(ws, 1, { sessionId: 7, videoEpoch: 1 }); await f.decoded();
+  f.peers.at(-1).connectionState = 'failed'; f.peers.at(-1).onconnectionstatechange();
+  ws.onmessage({ data: videoPacket(1, { protocol: 3, sequence: 17, format: 2 }) }); const image = finishJpeg(f);
+  assert.match(f.element('status').textContent, /WebP/);
+  assert.deepEqual(ws.sent.filter(m => m.type === 'ack').at(-1), { type: 'ack', sessionId: 7, videoEpoch: 1, sequence: 17 });
+  mediaStatus(ws, { rtcAvailable: false }); mediaStatus(ws, { rtcAvailable: true });
+  await f.offer(ws, 2, { sessionId: 7, videoEpoch: 1 });
+  assert.equal(image.hidden, false);
+  f.pointer('pointerdown', 100, 'touch-surface'); f.pointer('pointerup', 100, 'touch-surface');
+  await f.decoded();
+  assert.equal(image.hidden, true);
+  assert.equal(f.stats().presentation.activeMode, 'track-canvas');
+  assert.equal(f.stats().presentation.fallbackReason, null);
+  assert.equal(f.createdVideos.length, 0);
 });
