@@ -139,19 +139,30 @@ export function decodeVideoPacket(buffer) {
   return { ...packet, protocol, mime: format === 2 ? 'image/webp' : 'image/jpeg', jpeg: buffer.slice(headerBytes) };
 }
 
-export function probeWebp({ createImage = () => new Image(), schedule = setTimeout, cancel = clearTimeout } = {}) {
+export function probeWebp({ createImage = () => new Image(), schedule = setTimeout, cancel = clearTimeout,
+  createUrl = data => URL.createObjectURL(data), revokeUrl = url => URL.revokeObjectURL(url),
+} = {}) {
   return new Promise(resolve => {
-    let image, timer = null, finished = false;
+    let image, url = null, timer = null, finished = false;
     const finish = supported => {
       if (finished) return; finished = true; cancel(timer);
       if (image) { image.onload = image.onerror = null; image.removeAttribute('src'); }
+      if (url !== null) revokeUrl(url);
       resolve(supported);
     };
     try {
       image = createImage(); timer = schedule(() => finish(false), 1500);
       image.onload = () => finish(image.naturalWidth === 2 && image.naturalHeight === 2);
       image.onerror = () => finish(false);
-      image.src = 'data:image/webp;base64,UklGRjwAAABXRUJQVlA4IDAAAADQAQCdASoCAAIAAgA0JaACdLoB+AADsAD+8MQL/yC5YXXI1/8gP+QH/ID/+PIAAAA=';
+      // The Android page allows blob: images but deliberately blocks data: URLs.
+      // This is the same 2x2 WebP fixture used by the capability probe.
+      url = createUrl(new Blob([new Uint8Array([
+        82, 73, 70, 70, 60, 0, 0, 0, 87, 69, 66, 80, 86, 80, 56, 32, 48, 0, 0, 0,
+        208, 1, 0, 157, 1, 42, 2, 0, 2, 0, 2, 0, 52, 37, 160, 2, 116, 186, 1, 248,
+        0, 3, 176, 0, 254, 240, 196, 11, 255, 32, 185, 97, 117, 200, 215, 255, 32,
+        63, 228, 7, 252, 128, 255, 248, 242, 0, 0, 0,
+      ])], { type: 'image/webp' }));
+      image.src = url;
     } catch (_) { finish(false); }
   });
 }
