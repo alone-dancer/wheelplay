@@ -552,9 +552,9 @@
     <string name="web_video_renderer_compat">相容 Canvas</string>
     <string name="web_video_renderer_compat_description">使用離螢幕影片解碼，再繪製到畫布。</string>
     <string name="web_video_renderer_direct">直接 Canvas</string>
-    <string name="web_video_renderer_direct_description">不使用影片元素；不支援時使用 JPEG。</string>
+    <string name="web_video_renderer_direct_description">不使用影片元素；不支援時使用 JPEG / WebP。</string>
     <string name="web_video_renderer_experimental">實驗性</string>
-    <string name="web_video_renderer_hint">此瀏覽器不支援直接 Canvas，連線後將使用 JPEG。</string>
-    <string name="web_video_renderer_unavailable">（直接 Canvas 無法使用，已使用 JPEG）</string>
-    <string name="web_video_renderer_failed">（影片中斷，已改用 JPEG）</string>
+    <string name="web_video_renderer_hint">此瀏覽器不支援直接 Canvas，連線後將使用 JPEG / WebP。</string>
+    <string name="web_video_renderer_unavailable">（直接 Canvas 無法使用，已使用 JPEG / WebP）</string>
+    <string name="web_video_renderer_failed">（影片中斷，已改用 JPEG / WebP）</string>
 </resources>

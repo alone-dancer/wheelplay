@@ -64,8 +64,8 @@ WebSocket 控制连接的心跳与重连规则独立于视频策略；整个网�
 
 ## 直接 Canvas 的恢复与回退
 
-直接 Canvas 缺少主线程 Processor 时不请求 WebRTC，保留 JPEG；前端仍记录 `processor-unsupported` 并显示提示，不依赖服务端 fallback 字段。已收到 offer 后发现不可用时发送匹配 ID 的 rtc-fallback。Processor 构造、读取、绘制错误或轨道意外结束立即回退；回退保留控制和音频通道，释放触点、reader 及 Canvas 缓冲，不转用旧 Video 模式。
+直接 Canvas 缺少主线程 Processor 时不请求 WebRTC，保留图像串流（JPEG / WebP）；前端仍记录 `processor-unsupported` 并显示提示，不依赖服务端 fallback 字段。已收到 offer 后发现不可用时发送匹配 ID 的 rtc-fallback。Processor 构造、读取、绘制错误或轨道意外结束立即回退；回退保留控制和音频通道，释放触点、reader 及 Canvas 缓冲，不转用旧 Video 模式。
 
 首次成功绘制之前保持 JPEG，首帧等待 `max(10000ms, recoveryGraceMs)`。持续发送时分别检查解码和绘制进展，即使 framesDecoded 增长而画布不再更新，也会在所选容忍时间后回退。没有新输入的静态画面不触发渲染停滞；恢复输入时重新计时。连接短暂断开时仍保留最后一帧。
 
-`presentation.fallbackReason` 区分 processor-unsupported、renderer-error、track-ended、first-frame-timeout、decode-stalled、render-stalled、stats-unavailable、connection-failed、codec-unsupported 等原因；server-stop 表示服务端停止本次媒体。选择保留，重新连接或视频配置变化后允许重试。直接 Canvas 状态栏使用 renderedFps，原生 Video 与兼容 Canvas 继续使用 presentedFps / decodedFps。
+`presentation.fallbackReason` 区分 processor-unsupported、renderer-error、track-ended、first-frame-timeout、decode-stalled、render-stalled、stats-unavailable、connection-failed、codec-unsupported 等原因；server-stop 表示服务端停止本次媒体。选择保留；可恢复错误沿用上游有界退避重试，缺少 Processor、Canvas 2D 或明确的平台不支持错误停止当前配置的重试，重新连接或配置变化后再尝试。直接 Canvas 状态栏使用 renderedFps，原生 Video 与兼容 Canvas 继续使用 presentedFps / decodedFps。

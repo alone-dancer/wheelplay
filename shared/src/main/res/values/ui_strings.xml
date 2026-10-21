@@ -552,9 +552,9 @@
     <string name="web_video_renderer_compat">Compatibility Canvas</string>
     <string name="web_video_renderer_compat_description">Decode with an offscreen video element, then draw to the canvas.</string>
     <string name="web_video_renderer_direct">Direct Canvas</string>
-    <string name="web_video_renderer_direct_description">No video element. Use JPEG if unsupported.</string>
+    <string name="web_video_renderer_direct_description">No video element. Use JPEG / WebP if unsupported.</string>
     <string name="web_video_renderer_experimental">Experimental</string>
-    <string name="web_video_renderer_hint">This browser does not support Direct Canvas. JPEG will be used after connecting.</string>
-    <string name="web_video_renderer_unavailable"> (Direct Canvas unavailable; using JPEG)</string>
-    <string name="web_video_renderer_failed"> (video interrupted; using JPEG)</string>
+    <string name="web_video_renderer_hint">This browser does not support Direct Canvas. JPEG / WebP will be used after connecting.</string>
+    <string name="web_video_renderer_unavailable"> (Direct Canvas unavailable; using JPEG / WebP)</string>
+    <string name="web_video_renderer_failed"> (video interrupted; using JPEG / WebP)</string>
 </resources>

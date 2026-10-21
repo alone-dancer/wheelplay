@@ -43,9 +43,9 @@ WheelPlay 是一款 Android 局域网 CarPlay 服务端应用，可将 iPhone �
 
 - **原生 Video**：由视频元素直接显示 WebRTC 画面。
 - **兼容 Canvas**：保留离屏 `<video>` 解码并使用 `drawImage()` 绘制，优先视频帧回调，旧浏览器或离屏回调停顿时使用动画帧补偿。
-- **直接 Canvas**：使用主线程 `MediaStreamTrackProcessor` 读取 WebRTC `VideoFrame` 并绘制，全程不创建 `<video>`，也不使用 `VideoDecoder`。仅在 Worker 中提供 Processor 的浏览器不在首版支持范围；不支持或运行失败时直接使用 JPEG，不切换到旧的视频元素模式。
+- **直接 Canvas**：使用主线程 `MediaStreamTrackProcessor` 读取 WebRTC `VideoFrame` 并绘制，全程不创建 `<video>`，也不使用 `VideoDecoder`。仅在 Worker 中提供 Processor 的浏览器不在首版支持范围；不支持或运行失败时直接使用 JPEG / WebP，不切换到旧的视频元素模式。
 
-浏览器保存所选方式，刷新和自动重连后保留；禁用存储时仅当前页面有效。原有 Canvas 偏好自动迁移为「兼容 Canvas」。需要断开后重新选择，自动重连不会改变本次启动的方式。两种 Canvas 都在首帧绘制成功后才停止 JPEG；尺寸与触控按实际画面映射。Canvas 可能增加 GPU / CPU 消耗，不保证达到 60 fps。直接 Canvas 状态栏的 fps 是成功绘制次数，其他模式保留原有视频呈现 / 解码统计，均不等于屏幕实际刷新率。`window.wheelplayStats.presentation` 可查看所选 / 实际方式、绘制统计和回退原因。
+浏览器保存所选方式，刷新和自动重连后保留；禁用存储时仅当前页面有效。原有 Canvas 偏好自动迁移为「兼容 Canvas」。需要断开后重新选择，自动重连不会改变本次启动的方式。两种 Canvas 都在首帧绘制成功后才停止图像串流；尺寸与触控按实际画面映射。Canvas 可能增加 GPU / CPU 消耗，不保证达到 60 fps。直接 Canvas 状态栏的 fps 是成功绘制次数，其他模式保留原有视频呈现 / 解码统计，均不等于屏幕实际刷新率。`window.wheelplayStats.presentation` 可查看所选 / 实际方式、绘制统计和回退原因。
 
 Canvas 模式需要蔚来等车机实测：若遮罩只覆盖原生视频元素，改变显示路径可能有效；若系统停止解码或在整个页面上叠加遮罩，则无法保证有效。请在车辆停稳后验证，驾驶员行驶中只应使用必要的导航界面。
 
