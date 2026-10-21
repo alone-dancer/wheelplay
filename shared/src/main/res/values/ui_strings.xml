@@ -541,4 +541,6 @@
     <string name="ui_nband">"\nBand: "</string>
     <string name="ui_your_iphone">Your iPhone</string>
     <string name="ui_stopped">Stopped</string>
+    <string name="web_video_recovering">%1$s · Waiting for recovery · Touch paused</string>
+    <string name="web_video_input_unavailable">%1$s · Waiting for touch input</string>
 </resources>

@@ -366,6 +366,7 @@ internal class LanWebServer(
 
     private inner class Client(handshake: IHTTPSession) : WebSocket(handshake) {
         private val token = handshake.parameters["token"]?.firstOrNull()?.takeIf { it.isNotEmpty() }
+        private val versionedMedia = handshake.parameters["media"]?.firstOrNull() == "2"
 
         fun authorized() = token == null || pairing.authorized(token)
 
@@ -392,12 +393,13 @@ internal class LanWebServer(
                 onFailure = {
                     disconnect(context.getString(UiR.string.ui_streaming_connection_interrupted))
                 },
+                versionedVideo = versionedMedia,
             )
         private val rtcLock = Any()
         private var rtcSource: WebVideoSource? = null
         private var rtcConfig: WebVideoSource.Config? = null
         private var rtc: RtcVideoStream? = null
-        private var rtcAttempted = false
+        private val rtcRetry = RtcRetryPolicy()
         private var rtcId = 0L
         private var rtcAnswered = false
 
@@ -408,14 +410,15 @@ internal class LanWebServer(
                     stopRtc()
                     rtcSource = source
                     rtcConfig = source?.config
-                    rtcAttempted = false
+                    rtcRetry.reset()
                 }
             }
 
-        private fun stopRtc() =
+        private fun stopRtc(retryable: Boolean = true) =
             synchronized(rtcLock) {
                 val old = rtc
                 rtc = null
+                rtcRetry.finish(retryable)
                 if (old != null) {
                     rtcSource?.detach(old)
                     old.close()
@@ -427,13 +430,17 @@ internal class LanWebServer(
                 sender.frameAvailable()
             }
 
-        private fun startRtc() =
+        private fun startRtc() {
+            // Service stop holds WebSession before closing clients. Never acquire that monitor
+            // while holding rtcLock; carry a coherent snapshot and validate its source identity.
+            val media = WebSession.mediaSnapshot()
             synchronized(rtcLock) {
                 reconcileVideo()
-                if (rtcAttempted || ended.get() || !WebSession.videoActive) return
+                if (rtc != null || !rtcRetry.available || ended.get() || !WebSession.videoActive) return
                 val source = rtcSource ?: return
                 val config = rtcConfig ?: return
-                rtcAttempted = true
+                if (media.source !== source || media.sourceState == "stopped") return
+                if (!rtcRetry.start()) return
                 rtcAnswered = false
                 val id = ++rtcId
                 val recovery =
@@ -451,6 +458,8 @@ internal class LanWebServer(
                                         JSONObject()
                                             .put("type", "rtc-offer")
                                             .put("id", id)
+                                            .put("sessionId", media.sessionId)
+                                            .put("videoEpoch", media.videoEpoch)
                                             .put("codec", config.codec.name)
                                             .put("recoveryGraceMs", recovery.graceMs)
                                             .put("sdp", sdp)
@@ -458,7 +467,7 @@ internal class LanWebServer(
                                     )
                             }
                         },
-                        failure = { synchronized(rtcLock) { if (rtcId == id) stopRtc() } },
+                        failure = { retryable -> synchronized(rtcLock) { if (rtcId == id) stopRtc(retryable) } },
                     )
                 rtc = stream
                 if (!source.attach(stream, config)) {
@@ -467,6 +476,7 @@ internal class LanWebServer(
                 }
                 stream.start()
             }
+        }
 
         private fun reply(
             kind: WebStreamSender.Control,
@@ -619,28 +629,39 @@ internal class LanWebServer(
                         require(WebSession.reportBrowserViewport(width, height))
                     }
                     "ping" -> {
+                        // Match service-stop lock ordering: take the session snapshot first.
+                        val media = WebSession.mediaSnapshot()
                         reconcileVideo()
-                        val frame = WebSession.frame
                         synchronized(rtcLock) {
+                            val frame = media.frame
+                            val mediaRtc = rtc.takeIf { rtcSource === media.source }
                             reply(
                                 WebStreamSender.Control.STATUS,
                                 JSONObject()
                                     .put("type", "status")
-                                    .put("width", WebSession.width)
-                                    .put("height", WebSession.height)
+                                    .put("width", media.width)
+                                    .put("height", media.height)
+                                    .put("mediaProtocol", 2)
+                                    .put("sessionId", media.sessionId)
+                                    .put("videoEpoch", media.videoEpoch)
+                                    .put("sourceState", media.sourceState)
+                                    .put("inputReady", media.inputReady)
                                     .put("stage", WebSession.stage(context))
                                     .put(
                                         "streaming",
-                                        WebSession.videoActive &&
+                                        media.sourceState == "ready" &&
                                             (frame != null ||
-                                                rtc?.connected == true ||
-                                                rtc?.holdingFrame == true),
+                                                mediaRtc?.connected == true ||
+                                                mediaRtc?.holdingFrame == true),
                                     )
                                     .put(
                                         "rtcAvailable",
-                                        rtcConfig != null && !rtcAttempted && WebSession.videoActive,
+                                        rtcSource === media.source && rtcConfig != null &&
+                                            rtcRetry.available && media.sourceState == "ready",
                                     )
-                                    .put("rtcFrames", rtc?.sentFrames ?: 0)
+                                    .put("rtcRetryAfterMs", rtcRetry.retryAfterMs)
+                                    .put("rtcRetryBlocked", rtcRetry.blocked)
+                                    .put("rtcFrames", mediaRtc?.sentFrames ?: 0)
                                     .put(
                                         "performance",
                                         JSONObject()
@@ -657,7 +678,7 @@ internal class LanWebServer(
                                     .put(
                                         "fallback",
                                         rtcSource?.technology == StreamTechnology.WEBRTC &&
-                                            (rtcAttempted && rtc == null || rtcConfig == null),
+                                            (rtcRetry.attempted && rtc == null || rtcConfig == null),
                                     )
                                     .toString(),
                             )
@@ -699,11 +720,14 @@ internal class LanWebServer(
                         synchronized(rtcLock) {
                             if (data.getLong("id") == rtcId) {
                                 rtc?.displayed()
+                                if (rtc?.holdingFrame == true) rtcRetry.ready()
                                 sender.acknowledge()
                             }
                         }
                     "rtc-fallback" ->
-                        synchronized(rtcLock) { if (data.getLong("id") == rtcId) stopRtc() }
+                        synchronized(rtcLock) {
+                            if (data.getLong("id") == rtcId) stopRtc(data.optBoolean("retryable", true))
+                        }
                     "touch" -> {
                         val contacts = data.getJSONArray("contacts")
                         require(contacts.length() <= 2)
@@ -717,7 +741,10 @@ internal class LanWebServer(
                                     point.getBoolean("down"),
                                 )
                             }
-                        if (!WebSession.touch.touch(this, list, lastSeen)) {
+                        val accepted = if (versionedMedia) WebSession.mediaTouch(this,
+                            data.optLong("sessionId", -1), data.optLong("videoEpoch", -1), list, lastSeen)
+                        else WebSession.touch.touch(this, list, lastSeen)
+                        if (!accepted) {
                             reply(
                                 WebStreamSender.Control.INPUT_UNAVAILABLE,
                                 """{"type":"input-unavailable"}""",
