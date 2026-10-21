@@ -403,7 +403,11 @@ export function createTrackCanvasRenderer(canvas, {
         } finally { frame?.close(); }
       }
     } catch (error) {
-      if (current()) { stop(); onError(error.message === 'track-ended' ? 'track-ended' : 'renderer-error', isRtcErrorRetryable(error)); }
+      if (current()) {
+        // Let the receiver freeze the last picture before stop clears the canvas.
+        try { onError(error.message === 'track-ended' ? 'track-ended' : 'renderer-error', isRtcErrorRetryable(error)); }
+        finally { if (generation === token) stop(); }
+      }
     } finally {
       try { activeReader.releaseLock(); } catch (_) {}
       if (reader === activeReader) reader = null;

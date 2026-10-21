@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import { createTrackCanvasRenderer } from '../common/src/main/assets/web/app.js';
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
-function fixture({ contextAvailable = true, constructError = false } = {}) {
+function fixture({ contextAvailable = true, constructError = false, onError = () => {} } = {}) {
   const draws = [], ready = [], sizes = [], errors = [], readers = [], configurations = [];
   const context = { drawImage: (...args) => draws.push(args) };
   const canvas = { hidden: true, width: 0, height: 0, getContext: () => contextAvailable ? context : null };
   const renderer = createTrackCanvasRenderer(canvas, {
-    onReady: size => ready.push(size), onResize: size => sizes.push(size), onError: reason => errors.push(reason),
+    onReady: size => ready.push(size), onResize: size => sizes.push(size),
+    onError: reason => { errors.push(reason); onError(reason); },
     createProcessor(init) {
       if (constructError) throw new Error('not supported');
       configurations.push(init);
@@ -88,4 +89,27 @@ test('a canceled read rejection cannot report an error into a replacement sessio
   old.pending.shift().reject(new Error('late cancellation')); await flush();
   assert.equal(f.errors.length, 0); assert.equal(old.releases, 1);
   await f.frame(); assert.equal(f.ready.length, 1);
+});
+
+test('a read failure preserves the displayed frame for the error callback before releasing it', async () => {
+  let captured;
+  const f = fixture({ onError() {
+    captured = { hidden: f.canvas.hidden, width: f.canvas.width, height: f.canvas.height };
+  } });
+  f.renderer.start({}); await f.frame();
+  f.readers[0].pending.shift().reject(new Error('read failed')); await flush();
+  assert.deepEqual(captured, { hidden: false, width: 1280, height: 720 });
+  assert.equal(f.canvas.width, 0); assert.equal(f.canvas.hidden, true);
+  assert.equal(f.readers[0].cancels, 1); assert.equal(f.readers[0].releases, 1);
+});
+
+test('error cleanup does not stop a renderer restarted by its error callback', async () => {
+  const f = fixture({ onError() { f.renderer.start({}); } });
+  f.renderer.start({}); await f.frame();
+  const old = f.readers[0]; old.pending.shift().reject(new Error('read failed')); await flush();
+  await f.frame(720, 1280);
+  assert.equal(old.cancels, 1); assert.equal(old.releases, 1);
+  assert.equal(f.readers[1].cancels, undefined);
+  assert.equal(f.canvas.hidden, false); assert.equal(f.canvas.width, 720);
+  f.renderer.stop();
 });

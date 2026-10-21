@@ -757,6 +757,37 @@ test('Direct Canvas drawing errors use JPEG and do not change browser audio or t
   assert.equal(ws.sent.filter(m => m.type === 'touch').length, 2);
 });
 
+test('Direct Canvas failures freeze the last frame until the fallback image is decoded', async () => {
+  for (const failure of ['draw', 'end']) {
+    const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect();
+    const canvas = f.element('video-canvas'), held = f.element('held-frame');
+    let failDraw = false, copied = false;
+    canvas.getContext = () => ({ drawImage() { if (failDraw) throw new Error('draw failed'); } });
+    held.getContext = () => ({ drawImage(source) {
+      assert.equal(source, canvas); assert.equal(source.hidden, false);
+      assert.equal(source.width, 1280); assert.equal(source.height, 720);
+      copied = true;
+    } });
+    await f.offer(ws); await f.decoded();
+    f.pointer('pointerdown', 100, 'touch-surface');
+    if (failure === 'draw') { failDraw = true; await f.decoded(); }
+    else {
+      f.processors.at(-1).pending.shift()({ done: true });
+      await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.equal(copied, true); assert.equal(held.hidden, false);
+    assert.equal(canvas.width, 0); assert.equal(f.element('waiting').hidden, true);
+    assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+    assert.equal(f.processors[0].canceled, true); assert.equal(f.processors[0].released, true);
+    assert.equal(ws.sent.filter(m => m.type === 'rtc-fallback').length, 1);
+    ws.onmessage({ data: {} });
+    assert.equal(held.hidden, false, 'Keep the snapshot while the fallback image is loading');
+    [f.element('screen'), f.element('screen-next'), f.element('screen-third')].find(image => image.onload).onload();
+    assert.equal(held.hidden, true); assert.equal(held.width, 0);
+    assert.equal(f.createdVideos.length, 0);
+  }
+});
+
 test('an automatic retry keeps the launch mode until the user starts a new display session', async () => {
   const f = fixture({ storedMode: 'track-canvas' }), ws = await f.connect();
   f.select('native'); ws.close();
