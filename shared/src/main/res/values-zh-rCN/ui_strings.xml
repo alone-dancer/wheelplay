@@ -543,4 +543,6 @@
     <string name="ui_stopped">已停止</string>
     <string name="web_ignore_browser_zoom">忽略浏览器缩放</string>
     <string name="web_ignore_browser_zoom_help">浏览器缩放变化时，让 CarPlay 画面保持适配可见区域。此浏览器会记住选择。</string>
+    <string name="web_video_recovering">%1$s · 等待恢复 · 触控已暂停</string>
+    <string name="web_video_input_unavailable">%1$s · 等待触控输入</string>
 </resources>

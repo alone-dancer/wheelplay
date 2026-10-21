@@ -21,7 +21,7 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
   const visualViewport = visual ? { ...visual, addEventListener(type, fn) { visualEvents[type] = fn; } } : undefined;
   const mainRect = geometry ? { left: 0, top: geometry.top, width: geometry.width, height: geometry.height - geometry.top }
     : { left: 0, top: 0, width: 1280, height: 720 };
-  let nextTimer = 0, nextFrame = 0;
+  let nextTimer = 0, nextFrame = 0, clockNow = 1000;
   const element = id => {
     const classes = new Set();
     if (!elements.has(id)) elements.set(id, { hidden: false, value: '123456', handlers: {}, naturalWidth: 1280, naturalHeight: 720,
@@ -78,8 +78,9 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
     },
   },
     location: { host: 'server:8080' }, URL: { createObjectURL: () => 'blob:frame', revokeObjectURL() {} }, Date, WebSocket: Socket,
-    RTCPeerConnection: Peer, performance: { now: () => 0 },
-    setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
+    ArrayBuffer, DataView, Blob,
+    RTCPeerConnection: Peer, performance: { now: () => clockNow },
+    setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay, at: clockNow + delay }); return id; },
     clearTimeout(id) { timers.delete(id); }, setInterval() { return 0; }, clearInterval() {},
     requestAnimationFrame(fn) { const frame = ++nextFrame; raf.set(frame, fn); return frame; },
     cancelAnimationFrame(frame) { raf.delete(frame); },
@@ -97,14 +98,22 @@ function fixture({ storedCanvas = null, storedIgnoreZoom = null, storageDisabled
       const [id, timer] = [...timers].find(([, t]) => t.delay === 180);
       timers.delete(id); timer.fn();
     },
+    advance(ms) {
+      clockNow += ms;
+      for (;;) {
+        const entry = [...timers].find(([, timer]) => timer.at <= clockNow);
+        if (!entry) break;
+        timers.delete(entry[0]); entry[1].fn();
+      }
+    },
     async connect() {
       element('connect-form').handlers.submit({ preventDefault() {} });
       await new Promise(resolve => setImmediate(resolve));
       const ws = sockets.at(-1); ws.readyState = 1; ws.onopen(); return ws;
     },
-    frame(ws) { ws.onmessage({ data: {} }); element('screen').onload(); },
-    async offer(ws, id = 1) {
-      ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id, sdp: 'offer' }) });
+    frame(ws) { ws.onmessage({ data: {} }); [element('screen'), element('screen-next')].find(image => image.onload).onload(); },
+    async offer(ws, id = 1, meta = {}) {
+      ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id, sdp: 'offer', ...meta }) });
       await new Promise(resolve => setImmediate(resolve));
       peers.at(-1).ontrack({ streams: [{}] });
       await new Promise(resolve => setImmediate(resolve));
@@ -222,8 +231,9 @@ test('actual image onload retries ACK and preserves down/up during browser conge
 test('disconnect drops pending ACK and old animation callbacks cannot send into a new gesture', async () => {
   const f = fixture(), old = await f.connect(); f.frame(old); f.pointer('pointerdown');
   f.pointer('pointermove', 200);
-  old.bufferedAmount = 8192; f.frame(old);
-  const lateImageLoad = f.element('screen').onload;
+  old.bufferedAmount = 8192; old.onmessage({ data: {} });
+  const lateImageLoad = [f.element('screen'), f.element('screen-next')].find(image => image.onload).onload;
+  lateImageLoad();
   old.close();
   const current = await f.connect(); f.frame(current); f.pointer('pointerdown', 300);
   const before = current.sent.length;
@@ -304,6 +314,7 @@ test('Canvas failure falls back to JPEG while control and the selected preferenc
   assert.equal(f.element('video').classList.contains('offscreen-video'), false);
   assert.equal(f.timers.size > 0 && [...f.timers.values()].some(t => t.delay === 1000), false);
   assert.equal(ws.sent.at(-1).type, 'rtc-fallback');
+  assert.equal(ws.sent.at(-1).retryable, false);
   f.frame(ws); assert.equal(f.element('screen').hidden, false);
   f.pointer('pointerdown', 100, 'touch-surface'); f.pointer('pointerup', 100, 'touch-surface');
   assert.equal(ws.sent.filter(m => m.type === 'touch').length, 2);
@@ -343,7 +354,7 @@ test('interrupted display resumes with fresh authentication after a server resta
   const retry = [...f.timers.values()].find(t => t.delay === 1000);
   assert.ok(retry); await retry.fn();
   assert.equal(f.sockets.length, 2);
-  assert.equal(f.sockets[1].url, 'ws://server:8080/stream?token=fresh-session');
+  assert.equal(f.sockets[1].url, 'ws://server:8080/stream?token=fresh-session&media=2');
 });
 
 test('revocation during an active display stops retries and requires fresh pairing', async () => {
@@ -405,4 +416,194 @@ test('unsupported viewport shapes never reach Android as invalid control message
   f.visualEvents.resize(); f.reportViewport();
   assert.equal(ws.sent.filter(m => m.type === 'viewport').length, count);
   assert.equal(ws.readyState, 1);
+});
+
+function videoPacket(videoEpoch, { sessionId = 7, width = 1280, height = 720 } = {}) {
+  const packet = new ArrayBuffer(39), header = new DataView(packet);
+  header.setUint32(0, 0x32565057, true); header.setFloat64(4, sessionId, true);
+  header.setFloat64(12, videoEpoch, true); header.setFloat64(20, videoEpoch, true);
+  header.setUint32(28, width, true); header.setUint32(32, height, true);
+  new Uint8Array(packet, 36).set([0xff, 0xd8, 0xff]); return packet;
+}
+function mediaStatus(ws, extra = {}) {
+  ws.onmessage({ data: JSON.stringify({ type: 'status', mediaProtocol: 2, sessionId: 7, videoEpoch: 1,
+    width: 1280, height: 720, streaming: true, sourceState: 'ready', inputReady: true, ...extra }) });
+}
+function finishJpeg(f, width = 1280, height = 720) {
+  const image = [f.element('screen'), f.element('screen-next')].find(image => image.onload);
+  image.naturalWidth = width; image.naturalHeight = height; image.onload(); return image;
+}
+
+test('automatic RTC retry preserves JPEG and touch until the new video frame is ready', async () => {
+  for (const storedCanvas of [null, 'true']) {
+    const f = fixture({ storedCanvas }), ws = await f.connect(); mediaStatus(ws);
+    await f.offer(ws, 1, { sessionId: 7, videoEpoch: 1 });
+    const first = f.peers.at(-1); first.connectionState = 'failed'; first.onconnectionstatechange();
+    ws.onmessage({ data: videoPacket(1) }); const picture = finishJpeg(f);
+    mediaStatus(ws, { rtcAvailable: false, rtcRetryAfterMs: 5000 });
+    assert.equal(f.element('waiting').hidden, true);
+    f.advance(5000);
+    const startCount = () => ws.sent.filter(message => message.type === 'rtc-start').length;
+    const before = startCount();
+    mediaStatus(ws, { rtcAvailable: true, rtcRetryAfterMs: 0 });
+    mediaStatus(ws, { rtcAvailable: true, rtcRetryAfterMs: 0 });
+    assert.equal(startCount(), before + 1, 'one request for an advertised retry window');
+    ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 2, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(picture.hidden, false, 'negotiation must keep JPEG visible');
+    assert.equal(f.element('waiting').hidden, true);
+    f.pointer('pointerdown', 100, 'touch-surface'); f.pointer('pointerup', 100, 'touch-surface');
+    assert.equal(ws.sent.filter(message => message.type === 'touch').at(-1).contacts[0].down, false);
+    ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
+    const second = f.peers.at(-1);
+    second.ontrack({ streams: [{}] }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal([f.element('screen'), f.element('screen-next')].every(image => image.hidden), true);
+    assert.equal(f.element(storedCanvas ? 'video-canvas' : 'video').hidden, false);
+    assert.equal(f.element('waiting').hidden, true);
+    const starts = startCount();
+    mediaStatus(ws, { rtcAvailable: false }); mediaStatus(ws, { rtcAvailable: true });
+    assert.equal(startCount(), starts, 'an active receiver never requests a duplicate probe');
+  }
+});
+
+test('a transient Canvas draw error permits a later retry to restore video', async () => {
+  const f = fixture({ storedCanvas: 'true' }), ws = await f.connect(); mediaStatus(ws);
+  const canvas = f.element('video-canvas'), getContext = canvas.getContext;
+  canvas.getContext = () => ({ drawImage() { throw new Error('temporary surface loss'); } });
+  await f.offer(ws, 1, { sessionId: 7, videoEpoch: 1 });
+  assert.equal(ws.sent.at(-1).type, 'rtc-fallback');
+  assert.notEqual(ws.sent.at(-1).retryable, false);
+  ws.onmessage({ data: videoPacket(1) }); const picture = finishJpeg(f);
+  mediaStatus(ws, { rtcAvailable: false, rtcRetryAfterMs: 5000 }); f.advance(5000);
+  canvas.getContext = getContext;
+  mediaStatus(ws, { rtcAvailable: true });
+  await f.offer(ws, 2, { sessionId: 7, videoEpoch: 1 });
+  assert.equal(picture.hidden, true); assert.equal(canvas.hidden, false);
+});
+
+test('failed retry and stale peer callbacks do not disturb the current JPEG or a reconnected session', async () => {
+  const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+  ws.onmessage({ data: videoPacket(1) }); const picture = finishJpeg(f);
+  mediaStatus(ws, { rtcAvailable: true });
+  ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 1, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
+  await new Promise(resolve => setImmediate(resolve));
+  const peer = f.peers.at(-1), lateTrack = peer.ontrack;
+  peer.connectionState = 'failed'; peer.onconnectionstatechange();
+  assert.equal(picture.hidden, false); assert.equal(f.element('waiting').hidden, true);
+  mediaStatus(ws, { rtcAvailable: false, rtcRetryAfterMs: 10000 });
+  ws.close();
+  const current = await f.connect(); mediaStatus(current, { videoEpoch: 2 });
+  current.onmessage({ data: videoPacket(2) }); finishJpeg(f);
+  const before = current.sent.filter(message => message.type.startsWith('rtc-')).length;
+  lateTrack({ streams: [{}] }); f.advance(30000);
+  assert.equal(current.sent.filter(message => message.type.startsWith('rtc-')).length, before,
+    'old RTC callbacks and deadlines cannot send on a new socket');
+  assert.equal(f.element('waiting').hidden, true);
+});
+
+test('a same-version RTC offer keeps the pending JPEG available if negotiation fails', async () => {
+  const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+  ws.onmessage({ data: videoPacket(1) });
+  ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 1, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
+  await new Promise(resolve => setImmediate(resolve));
+  finishJpeg(f);
+  const peer = f.peers.at(-1); peer.connectionState = 'failed'; peer.onconnectionstatechange();
+  assert.equal(f.element('screen').hidden, false);
+  assert.equal(f.element('waiting').hidden, true);
+  assert.equal(f.element('touch-surface').classList.contains('stale'), false);
+});
+
+test('a source gap releases touch, keeps the picture, and expires with no more status messages', async () => {
+  const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+  ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
+  f.pointer('pointerdown', 100, 'touch-surface');
+  mediaStatus(ws, { sourceState: 'recovering', streaming: false, inputReady: false });
+  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+  assert.equal(f.element('waiting').hidden, true);
+  assert.equal(f.element('media-message').hidden, false);
+  assert.match(f.element('media-message').textContent, /触控已暂停/);
+  const before = ws.sent.filter(m => m.type === 'touch').length;
+  f.pointer('pointerdown', 100, 'touch-surface');
+  assert.equal(ws.sent.filter(m => m.type === 'touch').length, before);
+  f.advance(1999); assert.equal(f.element('waiting').hidden, true);
+  f.advance(1); assert.equal(f.element('waiting').hidden, false);
+  assert.equal(ws.readyState, 1);
+  mediaStatus(ws); assert.equal(f.element('waiting').hidden, true);
+});
+
+test('status during JPEG decoding leaves the old image and its input geometry intact', async () => {
+  const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+  ws.onmessage({ data: videoPacket(1) }); const first = finishJpeg(f);
+  ws.onmessage({ data: videoPacket(1) });
+  const back = f.element('screen-next'); back.naturalWidth = 0;
+  mediaStatus(ws);
+  assert.equal(first.hidden, false); assert.equal(back.hidden, true);
+  assert.equal(f.element('waiting').hidden, true);
+  f.pointer('pointerdown', 100, 'touch-surface');
+  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1), {
+    type: 'touch', sessionId: 7, videoEpoch: 1, contacts: [{ id: 0, x: 100 / 1280, y: 100 / 720, down: true }],
+  });
+});
+
+test('same-size rebuild cancels an old decode and ACKs it without accepting stale callbacks', async () => {
+  const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+  ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
+  ws.onmessage({ data: videoPacket(1) });
+  const late = f.element('screen-next').onload;
+  const ackCount = ws.sent.filter(m => m.type === 'ack').length;
+  mediaStatus(ws, { videoEpoch: 2 });
+  assert.equal(ws.sent.filter(m => m.type === 'ack').length, ackCount + 1);
+  late();
+  assert.equal(f.element('touch-surface').classList.contains('stale'), true);
+  ws.onmessage({ data: videoPacket(1) });
+  assert.equal(f.element('screen-next').onload, null);
+  ws.onmessage({ data: videoPacket(2) }); finishJpeg(f);
+  assert.equal(f.element('touch-surface').classList.contains('stale'), false);
+});
+
+test('a rotated JPEG arriving before status disables old touch and commits the new geometry', async () => {
+  const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+  ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
+  f.pointer('pointerdown', 100, 'touch-surface');
+  ws.onmessage({ data: videoPacket(2, { width: 720, height: 1280 }) });
+  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+  finishJpeg(f, 720, 1280);
+  assert.equal(f.element('touch-surface').classList.contains('stale'), true, 'input needs a ready status');
+  mediaStatus(ws, { videoEpoch: 2, width: 720, height: 1280 });
+  f.pointer('pointerdown', 640, 'touch-surface');
+  const touch = ws.sent.filter(m => m.type === 'touch').at(-1);
+  assert.equal(touch.videoEpoch, 2); assert.equal(touch.contacts[0].x, .5);
+});
+
+test('an RTC rebuild keeps a frozen picture and rejects the previous offer and frame callbacks', async () => {
+  for (const storedCanvas of [null, 'true']) {
+    const f = fixture({ storedCanvas }), ws = await f.connect(); mediaStatus(ws);
+    ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 1, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
+    await new Promise(resolve => setImmediate(resolve));
+    f.peers.at(-1).ontrack({ streams: [{}] }); await new Promise(resolve => setImmediate(resolve));
+    const oldCallbacks = [...f.videoCallbacks.values()];
+    mediaStatus(ws, { videoEpoch: 2 });
+    assert.equal(f.element('held-frame').hidden, false);
+    assert.equal(f.element('waiting').hidden, true);
+    assert.equal(f.element('touch-surface').classList.contains('stale'), true);
+    oldCallbacks.forEach(fn => fn(100, { presentedFrames: 100, mediaTime: .1 }));
+    const count = f.peers.length;
+    ws.onmessage({ data: JSON.stringify({ type: 'rtc-offer', id: 2, sdp: 'offer', sessionId: 7, videoEpoch: 1 }) });
+    assert.equal(f.peers.length, count);
+    f.advance(2000); assert.equal(f.element('waiting').hidden, false);
+    ws.onmessage({ data: videoPacket(2) }); finishJpeg(f);
+    assert.equal(f.element('held-frame').hidden, true);
+    assert.equal(f.element('waiting').hidden, true);
+  }
+});
+
+test('stopped media immediately covers an old image and a reconnected session needs a fresh frame', async () => {
+  const f = fixture(), old = await f.connect(); mediaStatus(old);
+  old.onmessage({ data: videoPacket(1) }); finishJpeg(f);
+  mediaStatus(old, { videoEpoch: 2, sourceState: 'stopped', streaming: false, inputReady: false });
+  assert.equal(f.element('waiting').hidden, false);
+  old.close(); const current = await f.connect(); mediaStatus(current, { videoEpoch: 3 });
+  f.advance(2000); assert.equal(f.element('waiting').hidden, false);
+  current.onmessage({ data: videoPacket(3) }); finishJpeg(f);
+  assert.equal(f.element('waiting').hidden, true);
 });
