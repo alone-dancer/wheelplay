@@ -317,6 +317,53 @@ class LanWebServerTest {
         } finally { WebSession.stop() }
     }
 
+    @Test fun browserGpsRequiresHttpsAndExplicitOptInAndClearsWhenTheViewerDisconnects() {
+        val context = org.robolectric.RuntimeEnvironment.getApplication()
+        val provider = WebSession.location.createProvider()
+        provider.start(); WebSession.start(context)
+        val fix = """{"type":"location","latitude":25,"longitude":121,"accuracy":5,"timestamp":1700000000000,"ageMillis":0}"""
+        fun settle(client: Socket) {
+            text(client, """{"type":"ping"}""")
+            while (org.json.JSONObject(frame(client).toString(Charsets.UTF_8)).optString("type") != "status") { }
+        }
+        try {
+            handshake(WebSession.code).use { client ->
+                assertTrue(readHeaders(client).startsWith("HTTP/1.1 101"))
+                text(client, """{"type":"location-start"}"""); text(client, fix); settle(client)
+                assertNull(provider.latestNmea())
+            }
+            val detachedBy = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (WebSession.hasViewer && System.nanoTime() < detachedBy) Thread.sleep(10)
+            assertFalse(WebSession.hasViewer)
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(8)
+            while (WebSession.tls == null && WebSession.tlsError == null && System.nanoTime() < deadline) Thread.sleep(20)
+            val endpoint = WebSession.tls ?: error("HTTPS failed: ${WebSession.tlsError}")
+            val root = CertificateFactory.getInstance("X.509").generateCertificate(endpoint.certificate.inputStream())
+            val store = KeyStore.getInstance(KeyStore.getDefaultType()).apply { load(null); setCertificateEntry("wheelplay", root) }
+            val managers = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply { init(store) }
+            val ssl = SSLContext.getInstance("TLS").apply { init(null, managers.trustManagers, null) }
+            (ssl.socketFactory.createSocket("127.0.0.1", 8443) as SSLSocket).use { client ->
+                client.soTimeout = 3000
+                client.sslParameters = client.sslParameters.apply { endpointIdentificationAlgorithm = "HTTPS" }
+                client.startHandshake()
+                client.outputStream.write(("GET /stream?code=${WebSession.code} HTTP/1.1\r\n" +
+                    "Host: 127.0.0.1:8443\r\nOrigin: https://127.0.0.1:8443\r\n" +
+                    "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n" +
+                    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").toByteArray())
+                assertTrue(readHeaders(client).startsWith("HTTP/1.1 101"))
+                text(client, fix); settle(client); assertNull(provider.latestNmea())
+                text(client, """{"type":"location-start"}"""); text(client, fix); settle(client)
+                assertTrue(provider.latestNmea()!!.contains("2500.0000,N,12100.0000,E"))
+                text(client, """{"type":"location-stop"}"""); settle(client); assertNull(provider.latestNmea())
+                text(client, """{"type":"location-start"}"""); text(client, fix); settle(client)
+                assertNotNull(provider.latestNmea())
+            }
+            val clearedBy = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
+            while (provider.latestNmea() != null && System.nanoTime() < clearedBy) Thread.sleep(10)
+            assertNull(provider.latestNmea())
+        } finally { WebSession.stop(); provider.close() }
+    }
+
     @Test fun trustedHttpsViewerCanSupplyNegotiatedMicrophonePcm() {
         val context = org.robolectric.RuntimeEnvironment.getApplication()
         WebSession.start(context)

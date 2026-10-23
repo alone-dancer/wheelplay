@@ -7,10 +7,12 @@ const messages = resourceStrings('values-zh-rCN');
 
 const source = readFileSync(new URL('../common/src/main/assets/web/text.js', import.meta.url), 'utf8').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' + readFileSync(new URL('../common/src/main/assets/web/browser-audio.js', import.meta.url), 'utf8')
   .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
+  readFileSync(new URL('../common/src/main/assets/web/browser-location.js', import.meta.url), 'utf8')
+    .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
   readFileSync(new URL('../common/src/main/assets/web/app.js', import.meta.url), 'utf8')
-    .replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
+    .replace(/^import .*browser-location\.js';$/m, '').replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
 function fixture({ storedCanvas = null, storedMode = null, processorAvailable = true, storedIgnoreZoom = null, storageDisabled = false, canvasAvailable = true, supportsWebp = false,
-  geometry = null, visual = null,
+  geometry = null, visual = null, locationBrowser = null,
   fullscreen = 'supported', codeDenied = false, resume = () => ({ token: 'session-token', name: 'Chrome' }) } = {}) {
   const elements = new Map(), timers = new Map(), raf = new Map(), sockets = [], peers = [], draws = [];
   const preferences = new Map(storedCanvas === null ? [] : [['wheelplay.canvasVideo', storedCanvas]]);
@@ -73,14 +75,14 @@ function fixture({ storedCanvas = null, storedMode = null, processorAvailable = 
     if (fullscreen === 'denied') return Promise.reject(new Error('fullscreen denied'));
     enterFullscreen(); return Promise.resolve();
   };
-  const context = { document, window: { addEventListener() {}, visualViewport,
+  const context = { document, navigator: locationBrowser, window: { isSecureContext: Boolean(locationBrowser), addEventListener() {}, visualViewport,
     localStorage: {
       getItem(key) { if (storageDisabled) throw new Error('denied'); return preferences.get(key) ?? null; },
       setItem(key, value) { if (storageDisabled) throw new Error('denied'); preferences.set(key, value); },
       removeItem(key) { preferences.delete(key); },
     },
   },
-    location: { host: 'server:8080' }, URL: { createObjectURL: () => 'blob:frame', revokeObjectURL() {} }, Date, WebSocket: Socket,
+    location: { host: 'server:8080', protocol: locationBrowser ? 'https:' : 'http:' }, URL: { createObjectURL: () => 'blob:frame', revokeObjectURL() {} }, Date, WebSocket: Socket,
     MediaStreamTrackProcessor: processorAvailable ? class {
       constructor(init) {
         this.init = init; this.pending = [];
@@ -859,4 +861,26 @@ test('Direct Canvas retries over v3 WebP without Video and only switches after t
   assert.equal(f.stats().presentation.activeMode, 'track-canvas');
   assert.equal(f.stats().presentation.fallbackReason, null);
   assert.equal(f.createdVideos.length, 0);
+});
+
+
+test('browser GPS option forwards through the authenticated stream and stops on socket loss', async () => {
+  let deliver, clears = 0, queries = 0;
+  const f = fixture({ locationBrowser: {
+    permissions: { async query() { queries++; return { state: 'granted' }; } },
+    geolocation: { watchPosition(success) { deliver = success; return 0; }, clearWatch() { clears++; } },
+  } });
+  const option = f.element('browser-location');
+  assert.equal(option.checked, false); assert.equal(queries, 0);
+  option.checked = true; option.handlers.change(); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(option.checked, true); assert.equal(deliver, undefined);
+  const ws = await f.connect(); await new Promise(resolve => setImmediate(resolve));
+  deliver({ timestamp: Date.now(), coords: { latitude: 25, longitude: 121, accuracy: 5 } });
+  const packet = ws.sent.find(m => m.type === 'location');
+  assert.equal(packet.latitude, 25); assert.equal(packet.longitude, 121);
+  assert.ok(ws.sent.findIndex(m => m.type === 'location-start') < ws.sent.indexOf(packet));
+  ws.close(); assert.equal(clears, 1);
+  const count = ws.sent.length;
+  deliver({ timestamp: Date.now(), coords: { latitude: 26, longitude: 121, accuracy: 5 } });
+  assert.equal(ws.sent.length, count);
 });

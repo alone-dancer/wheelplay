@@ -7,8 +7,10 @@ const messages = resourceStrings('values-zh-rCN');
 
 const source = readFileSync(new URL('../common/src/main/assets/web/text.js', import.meta.url), 'utf8').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' + readFileSync(new URL('../common/src/main/assets/web/browser-audio.js', import.meta.url), 'utf8')
   .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
+  readFileSync(new URL('../common/src/main/assets/web/browser-location.js', import.meta.url), 'utf8')
+    .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
   readFileSync(new URL('../common/src/main/assets/web/app.js', import.meta.url), 'utf8')
-    .replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
+    .replace(/^import .*browser-location\.js';$/m, '').replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const savedDevice = { id: 'd'.repeat(32), secret: 's'.repeat(32), name: 'Chrome · Android' };
 const ok = data => ({ ok: true, json: async () => data });
