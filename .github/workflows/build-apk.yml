@@ -1,0 +1,82 @@
+name: Build & Release Signed APK
+
+on:
+  push:
+    branches:
+      - main     # 当代码有 push 时触发（包括 sync workflow 自动合并代码推送后）
+      - master
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: gradle
+
+      # 解码签名密钥文件
+      - name: Decode Keystore
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > app/release.keystore
+
+      # 生成唯一的动态版本号和时间戳标签
+      - name: Generate Version Tag
+        id: version
+        run: |
+          DATE_STR=$(date +'%Y.%m.%d-%H%M%S')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TAG_NAME="v${DATE_STR}-${SHORT_SHA}"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      # 使用 Gradle 编译 APK
+      - name: Build Release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleRelease
+
+      # 为编译出的 APK 进行签名
+      - name: Sign APK
+        uses: raddox/android-sign-action@v1.2.0
+        id: sign_app
+        with:
+          releaseDirectory: app/build/outputs/apk/release
+          signingKeyBase64: ${{ secrets.KEYSTORE_BASE64 }}
+          alias: ${{ secrets.KEY_ALIAS }}
+          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
+          keyPassword: ${{ secrets.KEY_PASSWORD }}
+
+      # 重命名已签名的 APK，附带版本标识
+      - name: Rename Signed APK
+        run: |
+          SIGNED_APK_PATH="${{ steps.sign_app.outputs.signedFile }}"
+          NEW_APK_NAME="wheelplay-${{ steps.version.outputs.tag }}.apk"
+          mv "$SIGNED_APK_PATH" "app/build/outputs/apk/release/$NEW_APK_NAME"
+          echo "FINAL_APK_PATH=app/build/outputs/apk/release/$NEW_APK_NAME" >> $GITHUB_ENV
+          echo "FINAL_APK_NAME=$NEW_APK_NAME" >> $GITHUB_ENV
+
+      # 创建 GitHub Release 并上传带签名的 APK 供下载
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "WheelPlay ${{ steps.version.outputs.tag }}"
+          body: |
+            Automated build for WheelPlay.
+            - Commit: ${{ github.sha }}
+            - Date: ${{ steps.version.outputs.tag }}
+          draft: false
+          prerelease: false
+          files: ${{ env.FINAL_APK_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
