@@ -49,21 +49,22 @@ jobs:
             -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
             -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
 
-      # 4. 重命名并整理生成的 APK 文件（全目录精准搜索）
+      # 4. 全盘递归查找生成的 APK 文件（彻底解决模块路径不匹配问题）
       - name: Prepare APK for Release
         run: |
           mkdir -p output_apk
-          # 在整个 build 输出目录下查找非 unsigned 的 apk 文件
-          APK_PATH=$(find app/build/outputs/apk -type f -name "*.apk" ! -name "*unsigned*" | head -n 1)
+          
+          # 在整个工作区范围内递归搜索所有 apk 文件
+          echo "正在全盘搜索生成的 APK..."
+          APK_PATH=$(find . -type f -name "*.apk" ! -name "*unsigned*" ! -path "*/.gradle/*" | head -n 1)
           
           if [ -z "$APK_PATH" ]; then
-            echo "错误：未查找到生成的 APK 文件！"
-            echo "当前输出目录结构为："
-            ls -R app/build/outputs/ || true
+            echo "错误：未找到任何 APK 文件！当前项目产物结构为："
+            find . -type d -name "outputs" -o -name "build" || true
             exit 1
           fi
           
-          echo "找到编译生成的 APK: $APK_PATH"
+          echo "成功找到产物路径: $APK_PATH"
           NEW_APK_NAME="wheelplay-${{ steps.version.outputs.tag }}.apk"
           FINAL_PATH="output_apk/$NEW_APK_NAME"
           
