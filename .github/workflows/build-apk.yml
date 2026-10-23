@@ -45,9 +45,9 @@ jobs:
           chmod +x ./gradlew
           ./gradlew assembleRelease
 
-      # 为编译出的 APK 进行签名
+      # 为编译出的 APK 进行签名（已更换为稳定维护的 rstudio/android-sign-action）
       - name: Sign APK
-        uses: raddox/android-sign-action@v1.2.0
+        uses: rstudio/android-sign-action@v1.3.1
         id: sign_app
         with:
           releaseDirectory: app/build/outputs/apk/release
