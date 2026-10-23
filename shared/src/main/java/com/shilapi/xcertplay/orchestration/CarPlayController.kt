@@ -787,7 +787,7 @@ class CarPlayController(
             } catch (error: Throwable) {
                 Log.w(
                     IphoneCarPlayConfiguration.TAG,
-                    "Could not prewarm the Android location provider",
+                    "Could not prewarm the location provider",
                     error,
                 )
                 false

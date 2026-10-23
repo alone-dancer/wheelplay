@@ -166,6 +166,7 @@ internal class LanWebServer(
                 "/app.js" -> "app.js" to "text/javascript; charset=utf-8"
                 "/style.css" -> "style.css" to "text/css; charset=utf-8"
                 "/browser-audio.js" -> "browser-audio.js" to "text/javascript; charset=utf-8"
+                "/browser-location.js" -> "browser-location.js" to "text/javascript; charset=utf-8"
                 "/audio-worklet.js" -> "audio-worklet.js" to "text/javascript; charset=utf-8"
                 else -> return response(Response.Status.NOT_FOUND, "Not found")
             }
@@ -549,6 +550,7 @@ internal class LanWebServer(
                     return
                 }
                 viewer = this
+                WebSession.location.attach(this, secure)
                 WebSession.viewerStateChanged()
                 WebSession.audio.attach(
                     this,
@@ -609,6 +611,8 @@ internal class LanWebServer(
                     require(message.binaryPayload.size <= 2048)
                 lastSeen = SystemClock.elapsedRealtime()
                 when (data.getString("type")) {
+                    "location-start", "location-stop", "location-clear", "location" ->
+                        WebSession.location.control(this, data)
                     "audio-ready" -> {
                         val playback = data.getBoolean("playback")
                         val microphone = data.getBoolean("microphone")
@@ -805,6 +809,7 @@ internal class LanWebServer(
             synchronized(this@LanWebServer) {
                 if (viewer === this) {
                     WebSession.audio.detach(this)
+                    WebSession.location.detach(this)
                     viewer = null
                 }
                 WebSession.touch.drop(this)
