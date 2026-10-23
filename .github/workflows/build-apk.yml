@@ -24,7 +24,7 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      # 1. 解码签名密钥文件保存到根目录
+      # 1. 解码签名密钥文件
       - name: Decode Keystore
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > release.keystore
@@ -49,22 +49,26 @@ jobs:
             -Pandroid.injected.signing.key.alias="${{ secrets.KEY_ALIAS }}" \
             -Pandroid.injected.signing.key.password="${{ secrets.KEY_PASSWORD }}"
 
-      # 4. 重命名并整理生成的 APK 文件
+      # 4. 重命名并整理生成的 APK 文件（全目录精准搜索）
       - name: Prepare APK for Release
         run: |
-          # 查找生成的所有 release apk
-          APK_PATH=$(find app/build/outputs/apk/release -name "*.apk" ! -name "*unsigned*" | head -n 1)
+          mkdir -p output_apk
+          # 在整个 build 输出目录下查找非 unsigned 的 apk 文件
+          APK_PATH=$(find app/build/outputs/apk -type f -name "*.apk" ! -name "*unsigned*" | head -n 1)
           
           if [ -z "$APK_PATH" ]; then
             echo "错误：未查找到生成的 APK 文件！"
+            echo "当前输出目录结构为："
+            ls -R app/build/outputs/ || true
             exit 1
           fi
           
+          echo "找到编译生成的 APK: $APK_PATH"
           NEW_APK_NAME="wheelplay-${{ steps.version.outputs.tag }}.apk"
-          NEW_APK_PATH="app/build/outputs/apk/release/$NEW_APK_NAME"
+          FINAL_PATH="output_apk/$NEW_APK_NAME"
           
-          mv "$APK_PATH" "$NEW_APK_PATH"
-          echo "FINAL_APK_PATH=$NEW_APK_PATH" >> $GITHUB_ENV
+          cp "$APK_PATH" "$FINAL_PATH"
+          echo "FINAL_APK_PATH=$FINAL_PATH" >> $GITHUB_ENV
 
       # 5. 创建 GitHub Release 并上传带签名的 APK
       - name: Create GitHub Release
