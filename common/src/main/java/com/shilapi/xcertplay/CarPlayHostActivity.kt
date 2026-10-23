@@ -2689,8 +2689,10 @@ class CarPlayHostActivity : ComponentActivity() {
         AirPlayDisplaySettings.resolvePhysicalSizeMm(
             currentWidthPixels = size.width,
             currentHeightPixels = size.height,
-            maximumWidthPixels = maxOf(maximumDetectedWidthPixels, size.width),
-            maximumHeightPixels = maxOf(maximumDetectedHeightPixels, size.height),
+            // The browser canvas fills its display at every pixel resolution. Treating it as
+            // a fraction of a previous viewport shrinks the reported screen and enlarges iOS UI.
+            maximumWidthPixels = size.width,
+            maximumHeightPixels = size.height,
             referenceMillimeters = widthPhysicalMm,
             basis = physicalSizeBasis,
         )
