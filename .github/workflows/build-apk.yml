@@ -3,7 +3,7 @@ name: Build & Release Signed APK
 on:
   push:
     branches:
-      - main     # 当代码有 push 时触发（包括 sync workflow 自动合并代码推送后）
+      - main     # 当代码有 push 时触发
       - master
   workflow_dispatch: # 支持手动触发
 
@@ -24,12 +24,12 @@ jobs:
           distribution: 'temurin'
           cache: gradle
 
-      # 解码签名密钥文件
+      # 1. 解码签名密钥文件
       - name: Decode Keystore
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > app/release.keystore
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 --decode > release.keystore
 
-      # 生成唯一的动态版本号和时间戳标签
+      # 2. 生成唯一的动态版本号和时间戳标签
       - name: Generate Version Tag
         id: version
         run: |
@@ -39,33 +39,35 @@ jobs:
           echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
           echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
 
-      # 使用 Gradle 编译 APK
+      # 3. 使用 Gradle 编译 Release APK
       - name: Build Release APK
         run: |
           chmod +x ./gradlew
           ./gradlew assembleRelease
 
-      # 为编译出的 APK 进行签名（已更换为稳定维护的 rstudio/android-sign-action）
-      - name: Sign APK
-        uses: rstudio/android-sign-action@v1.3.1
-        id: sign_app
-        with:
-          releaseDirectory: app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.KEYSTORE_BASE64 }}
-          alias: ${{ secrets.KEY_ALIAS }}
-          keyStorePassword: ${{ secrets.KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.KEY_PASSWORD }}
-
-      # 重命名已签名的 APK，附带版本标识
-      - name: Rename Signed APK
+      # 4. 使用 Android 原生 apksigner 工具进行签名（无第三方依赖，最稳定）
+      - name: Sign APK with Native apksigner
         run: |
-          SIGNED_APK_PATH="${{ steps.sign_app.outputs.signedFile }}"
-          NEW_APK_NAME="wheelplay-${{ steps.version.outputs.tag }}.apk"
-          mv "$SIGNED_APK_PATH" "app/build/outputs/apk/release/$NEW_APK_NAME"
-          echo "FINAL_APK_PATH=app/build/outputs/apk/release/$NEW_APK_NAME" >> $GITHUB_ENV
-          echo "FINAL_APK_NAME=$NEW_APK_NAME" >> $GITHUB_ENV
+          # 自动定位 Android SDK 中的 apksigner 工具
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name apksigner | sort -V | tail -n 1)
+          
+          # 寻找 Gradle 编译出的未签名 Release APK
+          UNSIGNED_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          FINAL_APK_NAME="wheelplay-${{ steps.version.outputs.tag }}.apk"
+          FINAL_APK_PATH="app/build/outputs/apk/release/$FINAL_APK_NAME"
+          
+          # 使用 apksigner 进行签名并输出最终 APK
+          $APKSIGNER sign \
+            --ks release.keystore \
+            --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+            --ks-pass pass:"${{ secrets.KEYSTORE_PASSWORD }}" \
+            --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
+            --out "$FINAL_APK_PATH" \
+            "$UNSIGNED_APK"
+            
+          echo "FINAL_APK_PATH=$FINAL_APK_PATH" >> $GITHUB_ENV
 
-      # 创建 GitHub Release 并上传带签名的 APK 供下载
+      # 5. 创建 GitHub Release 并上传签名的 APK
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
