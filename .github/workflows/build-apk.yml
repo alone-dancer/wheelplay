@@ -5,6 +5,10 @@ on:
     branches:
       - main
       - master
+    paths-ignore:
+      - '**.md'
+      - '.github/workflows/Daily*.yml'
+      - '.github/workflows/sync*.yml'
   workflow_dispatch:
 
 jobs:
