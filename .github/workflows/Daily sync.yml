@@ -2,9 +2,9 @@ name: Daily Sync with Upstream
 
 on:
   schedule:
-    # 每天 UTC 0:00 (北京时间 8:00) 自动检查并同步
+    # 每天 UTC 0:00 (北京时间 8:00) 自动同步
     - cron: '0 0 * * *'
-  workflow_dispatch: # 支持手动点击运行测试
+  workflow_dispatch: # 支持手动点击运行
 
 jobs:
   sync:
@@ -16,7 +16,6 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -25,23 +24,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # 1. 配置并拉取原项目最新分支
+          # 1. 添加上游仓库并拉取其主分支 master
           git remote add upstream https://github.com/fython/wheelplay.git || true
-          git fetch upstream main
+          git fetch upstream master
 
           # 2. 检查是否有更新
           LOCAL_HASH=$(git rev-parse HEAD)
-          UPSTREAM_HASH=$(git rev-parse upstream/main)
+          UPSTREAM_HASH=$(git rev-parse upstream/master)
 
           echo "本地最新提交: $LOCAL_HASH"
           echo "上游最新提交: $UPSTREAM_HASH"
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
+          if git merge-base --is-ancestor upstream/master HEAD; then
             echo "仓库已经是最新状态，无需合并。"
           else
             echo "检测到上游有新提交，正在合并..."
-            # 使用 -Xours 策略：如果 workflow 等自身配置文件发生冲突，优先保留自己仓库的配置
-            git merge upstream/main -m "chore: sync upstream repository" -X ours --allow-unrelated-histories
-            git push origin main
-            echo "同步完成并已推送到 main 分支！"
+            # 使用 -X ours 策略避免工作流文件冲突
+            git merge upstream/master -m "chore: sync upstream repository" -X ours --allow-unrelated-histories
+            
+            # 使用包含写入权限的 Token 推送更新
+            git push "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" HEAD:${{ github.ref_name }}
+            echo "同步完成并已成功推送到仓库！"
           fi
