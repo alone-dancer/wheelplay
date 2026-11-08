@@ -5,14 +5,11 @@ import vm from 'node:vm';
 import { resourceStrings } from '../scripts/resource-strings.mjs';
 const messages = resourceStrings('values-zh-rCN');
 
-const source = readFileSync(new URL('../common/src/main/assets/web/text.js', import.meta.url), 'utf8').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' + readFileSync(new URL('../common/src/main/assets/web/browser-audio.js', import.meta.url), 'utf8')
-  .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
-  readFileSync(new URL('../common/src/main/assets/web/browser-location.js', import.meta.url), 'utf8')
-    .replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function') + '\n' +
-  readFileSync(new URL('../common/src/main/assets/web/app.js', import.meta.url), 'utf8')
-    .replace(/^import .*browser-location\.js';$/m, '').replace(/^import .*browser-audio\.js';$/m, '').replace(/^import .*text\.js';$/m, '').replaceAll('export function', 'function');
+const source = ['text.js', 'desktop-input.js', 'browser-audio.js', 'browser-location.js', 'browser-media-session.js', 'app.js']
+  .map(name => readFileSync(new URL(`../common/src/main/assets/web/${name}`, import.meta.url), 'utf8')
+    .replace(/^import .*;$/gm, '').replaceAll('export function', 'function')).join('\n');
 function fixture({ storedCanvas = null, storedMode = null, processorAvailable = true, storedIgnoreZoom = null, storageDisabled = false, canvasAvailable = true, supportsWebp = false,
-  geometry = null, visual = null, locationBrowser = null,
+  geometry = null, visual = null, mediaSession = null, locationBrowser = null,
   fullscreen = 'supported', codeDenied = false, resume = () => ({ token: 'session-token', name: 'Chrome' }) } = {}) {
   const elements = new Map(), timers = new Map(), raf = new Map(), sockets = [], peers = [], draws = [];
   const preferences = new Map(storedCanvas === null ? [] : [['wheelplay.canvasVideo', storedCanvas]]);
@@ -38,14 +35,14 @@ function fixture({ storedCanvas = null, storedMode = null, processorAvailable = 
       classList: { toggle(name, enabled) { if (enabled) classes.add(name); else classes.delete(name); }, contains: name => classes.has(name) },
       remove() { this.hidden = true; this.removed = true; },
       insertBefore(child) { child.removed = false; },
-      removeAttribute() {}, setAttribute() {}, setPointerCapture() {},
+      removeAttribute() {}, setAttribute() {}, setPointerCapture() {}, focus() {},
       getBoundingClientRect() {
         if (id !== 'display' || !classes.has('ignore-browser-zoom')) return mainRect;
         const scale = Number(this.style.transform.match(/scale\((.*)\)/)[1]);
         return { left: parseFloat(this.style.left), top: parseFloat(this.style.top),
           width: parseFloat(this.style.width) * scale, height: parseFloat(this.style.height) * scale };
       },
-      addEventListener(name, fn) { this.handlers[name] = fn; } });
+      addEventListener(name, fn) { const previous = this.handlers[name]; this.handlers[name] = previous ? event => { previous(event); fn(event); } : fn; } });
     return elements.get(id);
   };
   class Socket {
@@ -75,13 +72,14 @@ function fixture({ storedCanvas = null, storedMode = null, processorAvailable = 
     if (fullscreen === 'denied') return Promise.reject(new Error('fullscreen denied'));
     enterFullscreen(); return Promise.resolve();
   };
-  const context = { document, navigator: locationBrowser, window: { isSecureContext: Boolean(locationBrowser), addEventListener() {}, visualViewport,
+  const context = { document, navigator: { ...locationBrowser, mediaSession }, window: { isSecureContext: Boolean(locationBrowser), addEventListener() {}, visualViewport,
     localStorage: {
       getItem(key) { if (storageDisabled) throw new Error('denied'); return preferences.get(key) ?? null; },
       setItem(key, value) { if (storageDisabled) throw new Error('denied'); preferences.set(key, value); },
       removeItem(key) { preferences.delete(key); },
     },
   },
+    MediaMetadata: class { constructor(value) { Object.assign(this, value); } },
     location: { host: 'server:8080', protocol: locationBrowser ? 'https:' : 'http:' }, URL: { createObjectURL: () => 'blob:frame', revokeObjectURL() {} }, Date, WebSocket: Socket,
     MediaStreamTrackProcessor: processorAvailable ? class {
       constructor(init) {
@@ -387,7 +385,7 @@ test('interrupted display resumes with fresh authentication after a server resta
   const retry = [...f.timers.values()].find(t => t.delay === 1000);
   assert.ok(retry); await retry.fn();
   assert.equal(f.sockets.length, 2);
-  assert.equal(f.sockets[1].url, 'ws://server:8080/stream?token=fresh-session&media=2&images=3');
+  assert.equal(f.sockets[1].url, 'ws://server:8080/stream?token=fresh-session&media=2&images=3&nowPlaying=1');
 });
 
 test('revocation during an active display stops retries and requires fresh pairing', async () => {
@@ -592,12 +590,33 @@ test('a same-version RTC offer keeps the pending JPEG available if negotiation f
   assert.equal(f.element('touch-surface').classList.contains('stale'), false);
 });
 
+test('versioned pointer cancellation sends a cancel command while ordinary up still releases the contact', async () => {
+  for (const event of ['pointercancel', 'lostpointercapture']) {
+    const f = fixture(), ws = await f.connect(); mediaStatus(ws);
+    ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
+    f.pointer('pointerdown', 100, 'touch-surface');
+    f.pointer('pointermove', 200, 'touch-surface');
+    f.pointer(event, 200, 'touch-surface');
+    const afterCancel = ws.sent.length;
+    f.flushMoves(); f.pointer('pointerup', 200, 'touch-surface');
+    assert.equal(ws.sent.length, afterCancel);
+    assert.deepEqual(ws.sent.filter(m => m.type === 'input').at(-1), {
+      type: 'input', kind: 'release', sessionId: 7, videoEpoch: 1,
+    });
+    assert.deepEqual(ws.sent.filter(m => m.type === 'touch').map(m => m.contacts[0].down), [true]);
+    f.pointer('pointerdown', 100, 'touch-surface'); f.pointer('pointerup', 100, 'touch-surface');
+    f.pointer('lostpointercapture', 100, 'touch-surface');
+    assert.equal(ws.sent.filter(m => m.type === 'input').length, 1);
+    assert.equal(ws.sent.filter(m => m.type === 'touch').at(-1).contacts[0].down, false);
+  }
+});
+
 test('a source gap releases touch, keeps the picture, and expires with no more status messages', async () => {
   const f = fixture(), ws = await f.connect(); mediaStatus(ws);
   ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
   f.pointer('pointerdown', 100, 'touch-surface');
   mediaStatus(ws, { sourceState: 'recovering', streaming: false, inputReady: false });
-  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+  assert.deepEqual(ws.sent.filter(m => m.type === 'input').at(-1), { type: 'input', kind: 'release', sessionId: 7, videoEpoch: 1 });
   assert.equal(f.element('waiting').hidden, true);
   assert.equal(f.element('media-message').hidden, false);
   assert.match(f.element('media-message').textContent, /触控已暂停/);
@@ -645,7 +664,7 @@ test('a rotated JPEG arriving before status disables old touch and commits the n
   ws.onmessage({ data: videoPacket(1) }); finishJpeg(f);
   f.pointer('pointerdown', 100, 'touch-surface');
   ws.onmessage({ data: videoPacket(2, { width: 720, height: 1280 }) });
-  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+  assert.deepEqual(ws.sent.filter(m => m.type === 'input').at(-1), { type: 'input', kind: 'release', sessionId: 7, videoEpoch: 2 });
   finishJpeg(f, 720, 1280);
   assert.equal(f.element('touch-surface').classList.contains('stale'), true, 'input needs a ready status');
   mediaStatus(ws, { videoEpoch: 2, width: 720, height: 1280 });
@@ -830,7 +849,7 @@ test('Direct Canvas preserves versioned media isolation and input readiness acro
   await f.offer(ws, 1, { sessionId: 7, videoEpoch: 1 }); await f.decoded();
   f.pointer('pointerdown', 100, 'touch-surface');
   mediaStatus(ws, { videoEpoch: 2, sourceState: 'recovering', inputReady: false });
-  assert.deepEqual(ws.sent.filter(m => m.type === 'touch').at(-1).contacts, []);
+  assert.deepEqual(ws.sent.filter(m => m.type === 'input').at(-1), { type: 'input', kind: 'release', sessionId: 7, videoEpoch: 2 });
   assert.equal(f.element('held-frame').hidden, false);
   assert.equal(f.element('touch-surface').classList.contains('stale'), true);
   const count = f.peers.length;
@@ -863,7 +882,6 @@ test('Direct Canvas retries over v3 WebP without Video and only switches after t
   assert.equal(f.createdVideos.length, 0);
 });
 
-
 test('browser GPS option forwards through the authenticated stream and stops on socket loss', async () => {
   let deliver, clears = 0, queries = 0;
   const f = fixture({ locationBrowser: {
@@ -883,4 +901,25 @@ test('browser GPS option forwards through the authenticated stream and stops on 
   const count = ws.sent.length;
   deliver({ timestamp: Date.now(), coords: { latitude: 26, longitude: 121, accuracy: 5 } });
   assert.equal(ws.sent.length, count);
+});
+
+test('the paired socket publishes phone state to Media Session and clears it before reconnecting', async () => {
+  const handlers = new Map(), positions = [];
+  const session = { setActionHandler: (action, fn) => handlers.set(action, fn), setPositionState: value => positions.push(value) };
+  const f = fixture({ mediaSession: session }), ws = await f.connect();
+  assert.match(ws.url, /nowPlaying=1/);
+  const state = { type: 'now-playing', sessionId: 'phone', revision: 1, connectionGeneration: 3, trackRevision: 4,
+    connected: true, available: true, title: 'Song', artist: 'Artist', status: 'playing', durationMs: 60000, positionMs: 1000, speed: 1 };
+  ws.onmessage({ data: JSON.stringify(state) });
+  assert.equal(session.metadata.title, 'Song'); assert.equal(session.playbackState, 'playing');
+  assert.equal(positions.at(-1).position, 1);
+  const pause = handlers.get('pause'); pause();
+  assert.equal(ws.sent.at(-1).type, 'media-command'); assert.equal(ws.sent.at(-1).connectionGeneration, 3);
+  ws.onmessage({ data: JSON.stringify({ type: 'media-command-result', requestId: 1, result: 'sent' }) });
+  assert.equal(session.playbackState, 'playing');
+  ws.close();
+  assert.equal(session.metadata, null); assert.equal(session.playbackState, 'none');
+  const count = ws.sent.length; pause(); assert.equal(ws.sent.length, count);
+  ws.onmessage({ data: JSON.stringify({ ...state, revision: 2 }) });
+  assert.equal(session.metadata, null);
 });

@@ -38,7 +38,8 @@ class OffscreenVideoOutput(
     private var bitmap: Bitmap? = null
     lateinit var surface: Surface
         private set
-    private var hasImage = false
+    @Volatile private var hasImage = false
+    val hasFrame: Boolean get() = hasImage && !closed.get()
     private var hadViewer = false
     private var encodedOptions: ImageEncodingOptions? = null
     private val encoder = ImageFrameEncoder()
@@ -77,9 +78,9 @@ class OffscreenVideoOutput(
             finally { ready.countDown() }
         }
         if (!ready.await(10, TimeUnit.SECONDS)) {
-            close(); error("Offscreen video initialization timed out")
+            closeAndAwait(); error("Offscreen video initialization timed out")
         }
-        failure?.let { close(); throw IllegalStateException("Offscreen video unavailable", it) }
+        failure?.let { closeAndAwait(); throw IllegalStateException("Offscreen video unavailable", it) }
     }
 
     private fun initialize() {
@@ -183,9 +184,23 @@ class OffscreenVideoOutput(
         }
     }
 
+    @Volatile private var releaseFailure: Throwable? = null
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        handler.post { release(); thread.quitSafely() }
+        handler.post {
+            try { release() } catch (failure: Throwable) { releaseFailure = failure }
+            finally { thread.quitSafely() }
+        }
+    }
+
+    /** Call only after the producer has stopped writing to surface. */
+    fun closeAndAwait() {
+        close()
+        check(Thread.currentThread() !== thread) { "Cannot await own GL thread" }
+        thread.join(5_000)
+        if (thread.isAlive) throw com.shilapi.xcertplay.projection.ProjectionCleanupException("Offscreen output did not stop")
+        releaseFailure?.let { throw com.shilapi.xcertplay.projection.ProjectionCleanupException("Offscreen release failed", it) }
     }
 
     private fun release() {
